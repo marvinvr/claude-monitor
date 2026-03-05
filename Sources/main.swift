@@ -4,21 +4,16 @@ import Foundation
 // MARK: - Claude Names (persistent, hashed, short)
 
 enum ClaudeNamer {
+    // One name per starting letter for easy visual distinction
     private static let names = [
-        "arc", "ash", "axl", "bay", "bit", "bix", "blu", "cal",
-        "cor", "dax", "dev", "dot", "eko", "elm", "evo", "fae",
-        "fin", "fox", "gem", "gin", "glo", "hex", "hux", "ion",
-        "ivy", "jax", "jet", "kai", "kex", "kit", "lox", "lux",
-        "max", "mox", "neo", "nix", "nyx", "oak", "orb", "ori",
-        "pal", "pax", "phi", "pix", "qor", "rad", "ray", "rex",
-        "rio", "rox", "ryn", "sal", "sol", "syn", "tau", "tex",
-        "tor", "uno", "val", "vex", "vim", "vox", "wex", "xen",
-        "yew", "zed", "zen", "zip", "zoe", "zyx", "ace", "avi",
-        "bel", "cid", "dex", "eli", "flo", "gus", "hal", "ida",
+        "ace", "bay", "cor", "dax", "elm", "fox", "gem", "hex",
+        "ion", "jax", "kai", "lux", "max", "neo", "orb", "pax",
+        "qor", "ray", "sol", "tau", "uno", "vex", "wex", "xen",
+        "yew", "zed",
     ]
 
     private static var cache: [String: String] = [:]
-    private static var usedNames: Set<String> = []
+    private static var usedLetters: Set<Character> = []
 
     static func name(for tty: String) -> String {
         if let cached = cache[tty] { return cached }
@@ -29,25 +24,25 @@ enum ClaudeNamer {
             h = ((h &<< 5) &+ h) &+ UInt64(byte)
         }
 
-        // Pick a name, handle collisions
+        // Pick a name, skip names whose first letter is already taken
         let startIdx = Int(h % UInt64(names.count))
         var name = names[startIdx]
         var offset = 0
-        while usedNames.contains(name) {
+        while usedLetters.contains(name.first!) {
             offset += 1
-            name = names[(startIdx + offset) % names.count]
             if offset >= names.count { name = "\(names[startIdx])\(tty.suffix(1))"; break }
+            name = names[(startIdx + offset) % names.count]
         }
 
         cache[tty] = name
-        usedNames.insert(name)
+        usedLetters.insert(name.first!)
         return name
     }
 
     static func prune(activeTTYs: Set<String>) {
         let stale = cache.keys.filter { !activeTTYs.contains($0) }
         for key in stale {
-            if let name = cache[key] { usedNames.remove(name) }
+            if let name = cache[key] { usedLetters.remove(name.first!) }
             cache.removeValue(forKey: key)
         }
     }
@@ -301,16 +296,16 @@ let idleFrame3: [[P]] = sprite([
 let workFrame1: [[P]] = sprite([
     "..................",
     "......AA..........",
-    ".....AaaA...OOOO..",
-    "....OOFFOO..OGGO..",
-    "...OFFLLFFO.OGgO..",
-    "..OFFAEEAFFOOOOO..",
-    "..OFFAEEAFFO......",
-    "..OFFFFfffFO......",
-    "...OOFFFfOO.......",
+    ".....AaaA.........",
+    "....OOFFOO........",
+    "...OFFLLFFO.OOOO..",
+    "..OFFAEEAFFOOGGO..",
+    "..OFFAEEAFFOOGgO..",
+    "..OFFFFfffFOOOOO..",
+    "...OOFFFfOO.OOO...",
     ".OOKKKKKKKKKKKOO..",
     ".OKBBBBBBBBBBKBO..",
-    ".OKKBBKBBKBBKKBO..",
+    ".OKKBBKBBKBBKKO...",
     "..OkkkkkkkkkkkO...",
     "...OOOOOOOOOOO....",
     "..................",
@@ -320,16 +315,16 @@ let workFrame1: [[P]] = sprite([
 let workFrame2: [[P]] = sprite([
     "..................",
     "......AA..........",
-    ".....AaaA...OOOO..",
-    "....OOFFOO..OgGO..",
-    "...OFFLLFFO.OGgO..",
-    "..OFFAEEAFFOOOOO..",
-    "..OFFAEEAFFO......",
-    "..OFFFffffFO......",
-    "...OOFFffOO.......",
+    ".....AaaA.........",
+    "....OOFFOO........",
+    "...OFFLLFFO.OOOO..",
+    "..OFFAEEAFFOOgGO..",
+    "..OFFAEEAFFOOGGO..",
+    "..OFFFffffFOOOOO..",
+    "...OOFFffOO.OOO...",
     ".OOKKKKKKKKKKKOO..",
     ".OKBBBBBBBBBBKBO..",
-    ".OKBKBKBBKBBKKBO..",
+    ".OKBKBKBBKBBKKO...",
     "..OkkkkkkkkkkkO...",
     "...OOOOOOOOOOO....",
     "..................",
@@ -339,68 +334,69 @@ let workFrame2: [[P]] = sprite([
 let workFrame3: [[P]] = sprite([
     "..................",
     ".......AA.........",
-    "......AaaA..OOOO..",
-    ".....OOFFOO.OGGO..",
-    "....OFFLLFFOOGgO..",
-    "...OFFAEEAFFOOOO..",
-    "...OFFAEEAFFO.....",
-    "...OFFFFfffFO.....",
-    "....OFFFFfOO......",
+    "......AaaA........",
+    ".....OOFFOO.......",
+    "....OFFLLFFO.OOOO.",
+    "...OFFAEEAFFOOGgO.",
+    "...OFFAEEAFFOOGGO.",
+    "...OFFFFfffFOOOO..",
+    "....OFFFFfOO.OO...",
     "..OOKKKKKKKKKOO...",
-    "..OKBBBBBBBBKBO...",
-    "..OKKBBKBBKKKBO...",
-    "...OkkkkkkkkkO....",
-    "....OOOOOOOOO.....",
+    ".OKBBBBBBBBBBKBO..",
+    ".OKKBBKBBKKBKKO...",
+    "..OkkkkkkkkkkO....",
+    "...OOOOOOOOOO.....",
     "..................",
     "..................",
 ])
 
-// Done: little celebratory wave/check spark, 16x16
+// Done: celebratory hand-raise wave, 16x16
 let doneFrame1: [[P]] = sprite([
-    ".......AA.......",
-    "......AaaA......",
+    ".......A........",
+    "......AAA.......",
+    ".....AWWA.......",
     ".....OOFFOO.....",
-    "...OOFFLLFFOO...",
-    "...OFFAEEAFFO...",
-    "..OFFFAEEAFFFO..",
-    "..OFFFFfffFFFO..",
+    "...OOFFLLFFO....",
+    "...OFFAEEAFFOA..",
+    "..OFFFAEEAFFOAA.",
+    "..OFFFFfffFFOAA.",
     "..OFFFFFFFfFFO..",
     "...OOFFFFFfOO...",
     "....OOFFFfOO....",
     "...OkkkkkkkkO...",
     "...OKKKKKKKKO...",
     "....OOOOOOOO....",
-    "......O..D......",
-    ".....ODDDDO.....",
-    "......ODDO......",
+    "......O..O......",
+    ".....OOOOOO.....",
 ])
 
 let doneFrame2: [[P]] = sprite([
     "......AA........",
-    ".....AaaA...D...",
-    "....OOFFOO.DDD..",
-    "..OOFFLLFFOODD..",
-    "..OFFAEEAFFO....",
-    ".OFFFAEEAFFFO...",
-    ".OFFFFfffFFFO...",
-    ".OFFFFFFFfFFO...",
-    "..OOFFFFFfOO....",
-    "...OOFFFfOO.....",
-    "..OkkkkkkkkO....",
-    "..OKKKKKKKKO....",
-    "...OOOOOOOO.....",
-    ".....O..O.......",
-    "....ODDDDO......",
-    ".....ODDO.......",
+    ".....AWWA.......",
+    "....AAWWAA......",
+    ".....OOFFOO.....",
+    "...OOFFLLFFOA...",
+    "...OFFAEEAFFOAA.",
+    "..OFFFAEEAFFOAA.",
+    "..OFFFFfffFFOA..",
+    "..OFFFFFFFfFFO..",
+    "...OOFFFFFfOO...",
+    "....OOFFFfOO....",
+    "...OkkkkkkkkO...",
+    "...OKKKKKKKKO...",
+    "....OOOOOOOO....",
+    "......O..O......",
+    ".....OOOOOO.....",
 ])
 
 let doneFrame3: [[P]] = sprite([
-    "......AA...X....",
-    ".....AaaA.XXX...",
-    "....OOFFOO..X...",
-    "...OFFLLFFO.....",
+    "...........X....",
+    ".......A..XXX...",
+    "......AAA..X....",
+    ".....AWWA.......",
+    "...OOFFLLFFOA...",
     "..OFFAEEAFFO....",
-    "..OFFFAEEAFFO...",
+    "..OFFFAEEAFFOA..",
     ".OFFFFfffFFFO...",
     ".OFFFFFFFfFFO...",
     "..OOFFFFFfOO....",
@@ -409,8 +405,7 @@ let doneFrame3: [[P]] = sprite([
     "..OKKKKKKKKO....",
     "...OOOOOOOO.....",
     ".....O..O.......",
-    "....ODDDDO......",
-    ".....ODDO.......",
+    "....OOOOOO......",
 ])
 
 // MARK: - Sprite Renderer
@@ -558,20 +553,6 @@ class ClaudeSessionView: NSView {
             }
         }
 
-        // Checkmark for done
-        if session.state == .done {
-            let checkColor = NSColor(red: 0.3, green: 0.85, blue: 1.0, alpha: 0.9)
-            checkColor.setFill()
-            let cx = bounds.width / 2
-            // Small check mark
-            let check = NSBezierPath()
-            check.move(to: NSPoint(x: cx - 5, y: bounds.height - 5))
-            check.line(to: NSPoint(x: cx - 2, y: bounds.height - 8))
-            check.line(to: NSPoint(x: cx + 5, y: bounds.height - 1))
-            check.lineWidth = 2
-            checkColor.setStroke()
-            check.stroke()
-        }
     }
 }
 
