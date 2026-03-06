@@ -343,11 +343,13 @@ private struct ClaudeIndexEntry {
 
 private struct TranscriptActivity {
     private static let workingGrace: TimeInterval = 8
+    private static let toolWorkingGrace: TimeInterval = 90
     private static let idleDelay: TimeInterval = 600
 
     var openCallIds: Set<String> = []
     var lastActivityAt: Date?
-    var lastCompletionAt: Date?
+    var lastToolActivityAt: Date?
+    var lastAssistantMessageAt: Date?
     var sawRelevantEvent = false
 
     mutating func markActivity(_ date: Date) {
@@ -357,20 +359,34 @@ private struct TranscriptActivity {
         }
     }
 
-    mutating func markCompletion(_ date: Date) {
-        sawRelevantEvent = true
-        if lastCompletionAt == nil || date > lastCompletionAt! {
-            lastCompletionAt = date
+    mutating func markToolActivity(_ date: Date) {
+        markActivity(date)
+        if lastToolActivityAt == nil || date > lastToolActivityAt! {
+            lastToolActivityAt = date
+        }
+    }
+
+    mutating func markAssistantMessage(_ date: Date) {
+        markActivity(date)
+        if lastAssistantMessageAt == nil || date > lastAssistantMessageAt! {
+            lastAssistantMessageAt = date
         }
     }
 
     func resolvedState(now: Date) -> SessionState? {
         guard sawRelevantEvent else { return nil }
         if !openCallIds.isEmpty { return .working }
+        if let lastToolActivityAt,
+           (lastAssistantMessageAt == nil || lastToolActivityAt > lastAssistantMessageAt!),
+           now.timeIntervalSince(lastToolActivityAt) <= Self.toolWorkingGrace {
+            return .working
+        }
         if let lastActivityAt, now.timeIntervalSince(lastActivityAt) <= Self.workingGrace {
             return .working
         }
-        if let lastCompletionAt, now.timeIntervalSince(lastCompletionAt) <= Self.idleDelay {
+        if let lastAssistantMessageAt,
+           (lastToolActivityAt == nil || lastAssistantMessageAt >= lastToolActivityAt!),
+           now.timeIntervalSince(lastAssistantMessageAt) <= Self.idleDelay {
             return .done
         }
         return .idle
@@ -400,6 +416,7 @@ class SessionDetector {
 
     private var codexSessionPathByPid: [Int32: String] = [:]
     private var codexMetaByPath: [String: ConversationMeta] = [:]
+    private var codexMetaMtimeByPath: [String: Date] = [:]
     private var claudeSessionIdByPid: [Int32: String] = [:]
     private var claudeMetaBySessionId: [String: ConversationMeta] = [:]
     private var claudeSessionPathById: [String: String] = [:]
@@ -614,9 +631,14 @@ class SessionDetector {
             return ConversationMeta(id: nil, firstPrompt: nil, matchStatus: .unmatched, transcriptPath: nil)
         }
         codexSessionPathByPid[pid] = path
-        if let cached = codexMetaByPath[path] { return cached }
+        let mtime = Self.fileModificationDate(path: path)
+        if let cached = codexMetaByPath[path],
+           codexMetaMtimeByPath[path] == mtime {
+            return cached
+        }
         let parsed = parseCodexSessionMeta(path: path)
         codexMetaByPath[path] = parsed
+        codexMetaMtimeByPath[path] = mtime
         return parsed
     }
 
@@ -881,8 +903,14 @@ class SessionDetector {
                 }
                 if stopReason == "end_turn" {
                     activity.openCallIds.removeAll()
-                    activity.markCompletion(timestamp)
-                } else if hasToolUse || (message["role"] as? String) == "assistant" {
+                    if hasToolUse {
+                        activity.markToolActivity(timestamp)
+                    } else {
+                        activity.markAssistantMessage(timestamp)
+                    }
+                } else if hasToolUse {
+                    activity.markToolActivity(timestamp)
+                } else if (message["role"] as? String) == "assistant" {
                     activity.markActivity(timestamp)
                 }
             case "user":
@@ -892,7 +920,7 @@ class SessionDetector {
                         if item["type"] as? String == "tool_result",
                            let callId = item["tool_use_id"] as? String {
                             activity.openCallIds.remove(callId)
-                            activity.markActivity(timestamp)
+                            activity.markToolActivity(timestamp)
                         }
                     }
                 }
@@ -903,7 +931,6 @@ class SessionDetector {
                 let hookEvent = data["hookEvent"] as? String
                 if hookEvent == "Stop" {
                     activity.openCallIds.removeAll()
-                    activity.markCompletion(timestamp)
                 } else {
                     if let callId = object["toolUseID"] as? String {
                         if hookEvent == "PreToolUse" {
@@ -912,7 +939,7 @@ class SessionDetector {
                             activity.openCallIds.remove(callId)
                         }
                     }
-                    activity.markActivity(timestamp)
+                    activity.markToolActivity(timestamp)
                 }
             default:
                 continue
@@ -940,7 +967,7 @@ class SessionDetector {
                 if payloadType == "task_started" {
                     activity.markActivity(timestamp)
                 } else if payloadType == "task_complete" {
-                    activity.markCompletion(timestamp)
+                    activity.markActivity(timestamp)
                 } else if payloadType == "agent_message",
                           (payload["phase"] as? String) == "commentary" {
                     activity.markActivity(timestamp)
@@ -954,20 +981,14 @@ class SessionDetector {
                     if let callId = payload["call_id"] as? String {
                         activity.openCallIds.insert(callId)
                     }
-                    activity.markActivity(timestamp)
+                    activity.markToolActivity(timestamp)
                 case "function_call_output":
                     if let callId = payload["call_id"] as? String {
                         activity.openCallIds.remove(callId)
                     }
-                    activity.markActivity(timestamp)
-                    if activity.openCallIds.isEmpty {
-                        activity.markCompletion(timestamp)
-                    }
+                    activity.markToolActivity(timestamp)
                 case "custom_tool_call":
-                    activity.markActivity(timestamp)
-                    if (payload["status"] as? String) == "completed" {
-                        activity.markCompletion(timestamp)
-                    }
+                    activity.markToolActivity(timestamp)
                 case "reasoning":
                     activity.markActivity(timestamp)
                 case "message":
@@ -976,7 +997,7 @@ class SessionDetector {
                     if role == "assistant" && phase == "commentary" {
                         activity.markActivity(timestamp)
                     } else if role == "assistant" {
-                        activity.markCompletion(timestamp)
+                        activity.markAssistantMessage(timestamp)
                     }
                 default:
                     continue
@@ -990,6 +1011,14 @@ class SessionDetector {
     }
 
     private static func extractCodexUserText(from object: [String: Any]) -> String? {
+        if object["type"] as? String == "event_msg",
+           let payload = object["payload"] as? [String: Any],
+           payload["type"] as? String == "user_message",
+           let message = payload["message"] as? String {
+            let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+
         if object["type"] as? String == "message",
            object["role"] as? String == "user",
            let content = object["content"] {
@@ -1151,6 +1180,10 @@ class SessionDetector {
         if let date = formatter.date(from: value) { return date }
         formatter.formatOptions = [.withInternetDateTime]
         return formatter.date(from: value)
+    }
+
+    private static func fileModificationDate(path: String) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: path)[.modificationDate] as? Date) ?? nil
     }
 
     static func cwdPath(forPid pid: Int32) -> String? {

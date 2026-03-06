@@ -38,11 +38,16 @@ class ClaudeSessionView: NSView {
     override var isFlipped: Bool { false }
 
     override func draw(_ dirtyRect: NSRect) {
+        let tileBounds = bounds.insetBy(dx: 4, dy: 3)
+
         if hovered {
             NSColor(white: 1.0, alpha: 0.12).setFill()
-            NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5).fill()
+            NSBezierPath(roundedRect: tileBounds, xRadius: 5, yRadius: 5).fill()
         }
 
+        let subtitleText = session.truncatedFolder
+        let labelAreaHeight: CGFloat = subtitleText != nil ? 32 : 20
+        let spriteTopInset: CGFloat = 4
         let frames = sprites.frames(for: session.tool, state: session.state)
         let img: NSImage
         switch session.state {
@@ -54,8 +59,9 @@ class ClaudeSessionView: NSView {
             img = frames[(animFrame / 6) % frames.count]
         }
 
-        let x = (bounds.width - img.size.width) / 2
-        let y = (bounds.height - img.size.height) / 2 + 8
+        let x = tileBounds.minX + (tileBounds.width - img.size.width) / 2
+        let spriteAreaHeight = tileBounds.height - labelAreaHeight - spriteTopInset
+        let y = tileBounds.minY + labelAreaHeight + max((spriteAreaHeight - img.size.height) / 2, 0)
         NSGraphicsContext.current?.imageInterpolation = .none
         img.draw(in: NSRect(x: x, y: y, width: img.size.width, height: img.size.height),
                  from: .zero, operation: .sourceOver, fraction: 1.0)
@@ -73,10 +79,9 @@ class ClaudeSessionView: NSView {
             .foregroundColor: color
         ]
         let label = NSMutableAttributedString(string: name, attributes: nameAttrs)
-        let subtitleText = session.truncatedFolder
         let sz = label.size()
-        let nameY: CGFloat = subtitleText != nil ? 16 : 2
-        label.draw(at: NSPoint(x: (bounds.width - sz.width) / 2, y: nameY))
+        let nameY = tileBounds.minY + (subtitleText != nil ? 16 : 2)
+        label.draw(at: NSPoint(x: tileBounds.minX + (tileBounds.width - sz.width) / 2, y: nameY))
 
         // Subtitle (folder)
         if let subtitle = subtitleText {
@@ -86,7 +91,7 @@ class ClaudeSessionView: NSView {
             ]
             let folderStr = NSAttributedString(string: subtitle, attributes: folderAttrs)
             let fsz = folderStr.size()
-            folderStr.draw(at: NSPoint(x: (bounds.width - fsz.width) / 2, y: 2))
+            folderStr.draw(at: NSPoint(x: tileBounds.minX + (tileBounds.width - fsz.width) / 2, y: tileBounds.minY + 2))
         }
 
         // Activity dots for working
@@ -94,19 +99,20 @@ class ClaudeSessionView: NSView {
             let dots = (animFrame % 3) + 1
             NSColor(red: 0.4, green: 0.9, blue: 0.5, alpha: 0.9).setFill()
             let totalW = CGFloat(dots) * 4 + CGFloat(dots - 1) * 3
-            let sx = (bounds.width - totalW) / 2
+            let sx = tileBounds.minX + (tileBounds.width - totalW) / 2
+            let dotsY = tileBounds.maxY - spriteTopInset - 10
             for i in 0..<dots {
-                NSBezierPath(ovalIn: NSRect(x: sx + CGFloat(i) * 7, y: bounds.height - 6, width: 4, height: 4)).fill()
+                NSBezierPath(ovalIn: NSRect(x: sx + CGFloat(i) * 7, y: dotsY, width: 4, height: 4)).fill()
             }
         }
 
         // Conversation matching status marker, intentionally subtle.
         if session.conversationMatchStatus == .unmatched {
             NSColor(red: 0.95, green: 0.45, blue: 0.3, alpha: hovered ? 0.8 : 0.45).setFill()
-            NSBezierPath(ovalIn: NSRect(x: bounds.width - 10, y: bounds.height - 10, width: 5, height: 5)).fill()
+            NSBezierPath(ovalIn: NSRect(x: tileBounds.maxX - 9, y: tileBounds.maxY - 9, width: 5, height: 5)).fill()
         } else if session.conversationMatchStatus == .guessed {
             NSColor(red: 0.95, green: 0.8, blue: 0.3, alpha: hovered ? 0.8 : 0.45).setFill()
-            NSBezierPath(ovalIn: NSRect(x: bounds.width - 10, y: bounds.height - 10, width: 5, height: 5)).fill()
+            NSBezierPath(ovalIn: NSRect(x: tileBounds.maxX - 9, y: tileBounds.maxY - 9, width: 5, height: 5)).fill()
         }
     }
 }
@@ -116,6 +122,24 @@ class ClaudeSessionView: NSView {
 class TitleBarView: NSView {
     override func mouseDown(with event: NSEvent) {
         window?.performDrag(with: event)
+    }
+}
+
+class LoadingPlaceholderView: NSView {
+    var animFrame: Int = 0
+
+    override func draw(_ dirtyRect: NSRect) {
+        let dots = String(repeating: ".", count: (animFrame % 3) + 1)
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: safeMonospacedFont(ofSize: 22, weight: .bold),
+            .foregroundColor: NSColor(white: 0.65, alpha: 0.95)
+        ]
+        let label = NSAttributedString(string: dots, attributes: attrs)
+        let size = label.size()
+        label.draw(at: NSPoint(
+            x: (bounds.width - size.width) / 2,
+            y: (bounds.height - size.height) / 2 + 2
+        ))
     }
 }
 
