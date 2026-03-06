@@ -34,7 +34,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         titleLabel = NSTextField(labelWithString: "Agents")
         titleLabel.font = safeMonospacedFont(ofSize: 12, weight: .bold)
-        titleLabel.textColor = NSColor(red: 0.85, green: 0.45, blue: 0.22, alpha: 1.0)
+        titleLabel.textColor = NSColor(white: 0.95, alpha: 1.0)
         content.addSubview(titleLabel)
 
         rebuildViews()
@@ -113,9 +113,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let isLoading = !hasCompletedInitialPoll
         let cols = isLoading ? 1 : min(count, maxCols)
         let rows = isLoading ? 1 : (count == 0 ? 0 : (count + maxCols - 1) / maxCols)
+        let emptyStateText = "No active sessions"
+        let emptyStateFont = safeMonospacedFont(ofSize: 10, weight: .regular)
+        let emptyStateHorizontalInset: CGFloat = 24
+        let emptyStateVerticalOffset: CGFloat = -6
+        let emptyStateMinWidth = ceil((emptyStateText as NSString).size(withAttributes: [.font: emptyStateFont]).width) + emptyStateHorizontalInset * 2
 
         let titleToGridGap: CGFloat = pad
-        let winW = max(CGFloat(max(cols, 1)) * cellW + pad * 2, 120)
+        let minWinW = (!isLoading && count == 0) ? emptyStateMinWidth : 120
+        let winW = max(CGFloat(max(cols, 1)) * cellW + pad * 2, minWinW)
         var winH = titleH + pad * 2
         if rows > 0 { winH += CGFloat(rows) * cellH }
         if !isLoading && count == 0 { winH += 40 }
@@ -145,11 +151,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if count == 0 {
-            let lbl = NSTextField(labelWithString: "No active sessions")
-            lbl.font = safeMonospacedFont(ofSize: 10, weight: .regular)
-            lbl.textColor = NSColor(white: 0.4, alpha: 1.0)
-            lbl.sizeToFit()
-            lbl.frame.origin = NSPoint(x: (winW - lbl.frame.width) / 2, y: winH / 2 - 10)
+            let lbl = NSTextField(labelWithString: emptyStateText)
+            lbl.font = emptyStateFont
+            lbl.textColor = NSColor(white: 0.55, alpha: 1.0)
+            lbl.alignment = .center
+            let labelHeight = ceil(lbl.fittingSize.height)
+            lbl.frame = NSRect(
+                x: emptyStateHorizontalInset,
+                y: winH / 2 - labelHeight / 2 + emptyStateVerticalOffset,
+                width: winW - emptyStateHorizontalInset * 2,
+                height: labelHeight
+            )
             content.addSubview(lbl)
             return
         }

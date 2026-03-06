@@ -45,8 +45,7 @@ extension AppDelegate {
             return
         }
 
-        let toolWindows = windows.filter { windowLikelyMatchesTool($0, tool: session.tool) }
-        let windowPool = toolWindows.isEmpty ? windows : toolWindows
+        let windowPool = candidateWindowPool(for: session, windows: windows)
 
         // Fallback 1: unique AXDocument match (full cwd path).
         if let cwd = sessionCwd {
@@ -55,6 +54,11 @@ extension AppDelegate {
                 raiseGhosttyWindow(match, app: ghostty)
                 return
             }
+        }
+
+        if let remoteMatch = uniqueRemoteWindowMatch(session: session, windows: windowPool) {
+            raiseGhosttyWindow(remoteMatch, app: ghostty)
+            return
         }
 
         // Fallback 2: unique window title match by directory name.
@@ -82,6 +86,12 @@ extension AppDelegate {
                 raiseGhosttyWindow(match.window, app: ghostty)
                 return
             }
+        }
+
+        if let remoteTabMatch = uniqueRemoteTabMatch(session: session, windows: windowPool) {
+            AXUIElementPerformAction(remoteTabMatch.tab, kAXPressAction as CFString)
+            raiseGhosttyWindow(remoteTabMatch.window, app: ghostty)
+            return
         }
 
         // Fallback 4: unique full-path title match.
@@ -187,6 +197,52 @@ extension AppDelegate {
         return nil
     }
 
+    func candidateWindowPool(for session: ClaudeSession, windows: [AXUIElement]) -> [AXUIElement] {
+        guard !session.isRemote else { return windows }
+        let toolWindows = windows.filter { windowLikelyMatchesTool($0, tool: session.tool) }
+        return toolWindows.isEmpty ? windows : toolWindows
+    }
+
+    func remoteTitleNeedles(for session: ClaudeSession) -> [String] {
+        guard let remoteHost = session.remoteHost, !remoteHost.isEmpty else { return [] }
+        let rawHost = remoteHost.split(separator: "@").last.map(String.init) ?? remoteHost
+        let hostWithoutPort: String
+        if rawHost.hasPrefix("["),
+           let closingBracket = rawHost.firstIndex(of: "]") {
+            hostWithoutPort = String(rawHost[rawHost.index(after: rawHost.startIndex)..<closingBracket])
+        } else {
+            hostWithoutPort = rawHost.split(separator: ":", maxSplits: 1).first.map(String.init) ?? rawHost
+        }
+        let shortHost = hostWithoutPort.split(separator: ".", maxSplits: 1).first.map(String.init) ?? hostWithoutPort
+        return Array(Set([hostWithoutPort, shortHost]).filter { !$0.isEmpty })
+    }
+
+    func uniqueRemoteWindowMatch(session: ClaudeSession, windows: [AXUIElement]) -> AXUIElement? {
+        let needles = remoteTitleNeedles(for: session)
+        guard !needles.isEmpty else { return nil }
+        let matches = windows.filter { window in
+            let title = axTitle(of: window)
+            return needles.contains(where: { title.localizedCaseInsensitiveContains($0) })
+        }
+        return matches.count == 1 ? matches.first : nil
+    }
+
+    func uniqueRemoteTabMatch(session: ClaudeSession, windows: [AXUIElement]) -> (window: AXUIElement, tab: AXUIElement)? {
+        let needles = remoteTitleNeedles(for: session)
+        guard !needles.isEmpty else { return nil }
+
+        var matches: [(window: AXUIElement, tab: AXUIElement)] = []
+        for window in windows {
+            for tab in tabs(in: window) {
+                let title = axTitle(of: tab)
+                if needles.contains(where: { title.localizedCaseInsensitiveContains($0) }) {
+                    matches.append((window, tab))
+                }
+            }
+        }
+        return matches.count == 1 ? matches.first : nil
+    }
+
     func windowLikelyMatchesTool(_ window: AXUIElement, tool: SessionTool) -> Bool {
         let title = axTitle(of: window).lowercased()
         switch tool {
@@ -206,10 +262,23 @@ extension AppDelegate {
             if !docMatches.isEmpty { candidateWindows = docMatches }
         }
 
-        let toolMatches = candidateWindows.filter { windowLikelyMatchesTool($0, tool: session.tool) }
-        if !toolMatches.isEmpty { candidateWindows = toolMatches }
+        if session.isRemote {
+            let hostMatches = candidateWindows.filter { window in
+                let title = axTitle(of: window)
+                return remoteTitleNeedles(for: session).contains(where: { title.localizedCaseInsensitiveContains($0) })
+            }
+            if !hostMatches.isEmpty { candidateWindows = hostMatches }
+        } else {
+            let toolMatches = candidateWindows.filter { windowLikelyMatchesTool($0, tool: session.tool) }
+            if !toolMatches.isEmpty { candidateWindows = toolMatches }
+        }
 
-        let peerToolSessions = sessions.filter { $0.tool == session.tool }
+        let peerToolSessions: [ClaudeSession]
+        if session.isRemote {
+            peerToolSessions = sessions.filter { $0.isRemote && $0.remoteHost == session.remoteHost }
+        } else {
+            peerToolSessions = sessions.filter { $0.tool == session.tool }
+        }
         var peerTTYs = Set(peerToolSessions.map(\.tty))
 
         if let cwd = sessionCwd {
@@ -230,10 +299,11 @@ extension AppDelegate {
 
     func bestEffortWindow(session: ClaudeSession, windows: [AXUIElement], sessionCwd: String?, loginTTYs: [String]) -> AXUIElement? {
         let sorted = windowsSortedByCreation(windows)
-        var pool = sorted
+        var pool = candidateWindowPool(for: session, windows: sorted)
 
-        let toolWindows = pool.filter { windowLikelyMatchesTool($0, tool: session.tool) }
-        if !toolWindows.isEmpty { pool = toolWindows }
+        if session.isRemote, let remoteMatch = uniqueRemoteWindowMatch(session: session, windows: pool) {
+            return remoteMatch
+        }
 
         if let cwd = sessionCwd {
             let docMatches = pool.filter { axDocument(of: $0) == cwd }

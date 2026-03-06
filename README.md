@@ -1,16 +1,17 @@
 # Agent Monitor
 
-macOS floating window that shows your active Claude Code CLI sessions as pixel art sprites.
+macOS floating window that shows your active Claude Code and Codex CLI sessions as pixel art sprites.
 
 ![macOS](https://img.shields.io/badge/macOS-13%2B-blue)
 
 ## What it does
 
-- Polls running processes to find interactive `claude` CLI sessions
-- Shows each session as an animated pixel art Claude sparkle
-- Three states: **idle** (waiting), **working** (typing animation), **done** (hand raised, needs your input)
-- Click a session to jump to its Ghostty terminal tab/window
-- Always-on-top floating panel, no dock icon
+- Polls running processes to find interactive `claude` and `codex` sessions
+- Shows each session as an animated pixel art sprite in a floating always-on-top panel
+- Three states: **idle**, **working**, **done**
+- Click a session to jump to the matching Ghostty tab or window
+- Works with local sessions and basic remote/SSH sessions
+- Lives in the menu bar and runs without a dock icon
 
 ## Build & Run
 
@@ -28,8 +29,6 @@ cp .build/release/AgentMonitor "/Applications/Agent Monitor.app/Contents/MacOS/A
 cp Info.plist "/Applications/Agent Monitor.app/Contents/Info.plist"
 ```
 
-Then launch from Spotlight (Cmd+Space -> "Agent Monitor") or open from `/Applications`.
-
 ## Requirements
 
 - macOS 13+
@@ -37,4 +36,10 @@ Then launch from Spotlight (Cmd+Space -> "Agent Monitor") or open from `/Applica
 
 ## Session Names
 
-Each session gets a unique 3-letter name (e.g. `hex`, `nyx`, `vox`) derived from its TTY, so you can tell them apart at a glance.
+Sessions use a short generated name by default. When possible, Agent Monitor also derives a better title from the conversation and shows the current folder or remote host as a subtitle.
+
+## Notes
+
+- The panel resizes automatically as sessions appear or disappear
+- On launch it shows a small loading state, then `No active sessions` if nothing is running
+- Hovering a session highlights it and tooltips show extra details like PID, CPU, TTY, remote host, and conversation match status

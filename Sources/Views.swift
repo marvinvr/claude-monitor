@@ -45,7 +45,7 @@ class ClaudeSessionView: NSView {
             NSBezierPath(roundedRect: tileBounds, xRadius: 5, yRadius: 5).fill()
         }
 
-        let subtitleText = session.truncatedFolder
+        let subtitleText = session.subtitleText
         let labelAreaHeight: CGFloat = subtitleText != nil ? 32 : 20
         let spriteTopInset: CGFloat = 4
         let frames = sprites.frames(for: session.tool, state: session.state)

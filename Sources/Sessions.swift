@@ -19,12 +19,14 @@ enum ConversationMatchStatus: String {
     case unmatched
     case guessed
     case verified
+    case unavailable
 
     var rank: Int {
         switch self {
         case .unmatched: return 0
         case .guessed: return 1
         case .verified: return 2
+        case .unavailable: return 0
         }
     }
 
@@ -48,11 +50,22 @@ struct ClaudeSession: Hashable {
     let conversationId: String?
     let conversationTitle: String?
     let conversationMatchStatus: ConversationMatchStatus
+    let remoteHost: String?
+    let remoteTTY: String?
+
+    var isRemote: Bool { remoteHost != nil }
+
+    private var namingKey: String {
+        if let remoteHost {
+            return "ssh:\(tty):\(remoteHost):\(remoteTTY ?? ""):\(tool.rawValue)"
+        }
+        return tty
+    }
 
     var displayName: String {
         guard isInteractive else { return "sub" }
         if let title = conversationTitle, !title.isEmpty { return title }
-        return ClaudeNamer.name(for: tty)
+        return ClaudeNamer.name(for: namingKey)
     }
 
     var toolBadge: String {
@@ -62,9 +75,14 @@ struct ClaudeSession: Hashable {
         }
     }
 
-    var truncatedFolder: String? {
-        guard let folder = folderName else { return nil }
-        return folder.count > 10 ? String(folder.prefix(7)) + "..." : folder
+    var subtitleText: String? {
+        if let folder = folderName {
+            return folder.count > 10 ? String(folder.prefix(7)) + "..." : folder
+        }
+        if let remoteHost {
+            return remoteHost.count > 10 ? String(remoteHost.prefix(7)) + "..." : remoteHost
+        }
+        return nil
     }
 
     var tooltipText: String {
@@ -79,6 +97,13 @@ struct ClaudeSession: Hashable {
         let toolName = tool.rawValue.capitalized
         let folder = folderName.map { " in \($0)" } ?? ""
         let convo = conversationId.map { "\nSession: \($0)" } ?? ""
+        let remote: String
+        if let remoteHost {
+            let remoteTTY = remoteTTY.map { " [\($0)]" } ?? ""
+            remote = "\nRemote: \(remoteHost)\(remoteTTY)"
+        } else {
+            remote = ""
+        }
         let match: String
         switch conversationMatchStatus {
         case .verified:
@@ -87,8 +112,10 @@ struct ClaudeSession: Hashable {
             match = "\nConversation: guessed"
         case .unmatched:
             match = "\nConversation: no match"
+        case .unavailable:
+            match = ""
         }
-        return "\(name) [\(toolName)] - \(stateStr) (\(cpu) CPU)\(folder)\nPID: \(pid) [\(tty)]\(convo)\(match)"
+        return "\(name) [\(toolName)] - \(stateStr) (\(cpu) CPU)\(folder)\nPID: \(pid) [\(tty)]\(remote)\(convo)\(match)"
     }
 
     func hash(into hasher: inout Hasher) { hasher.combine(pid) }
@@ -130,8 +157,8 @@ enum ClaudeNamer {
         return name
     }
 
-    static func prune(activeTTYs: Set<String>) {
-        let stale = cache.keys.filter { !activeTTYs.contains($0) }
+    static func prune(activeKeys: Set<String>) {
+        let stale = cache.keys.filter { !activeKeys.contains($0) }
         for key in stale {
             if let name = cache[key] { usedLetters.remove(name.first!) }
             cache.removeValue(forKey: key)
@@ -405,6 +432,48 @@ class SessionDetector {
         let binaryName: String
     }
 
+    private struct SSHDestination: Hashable {
+        let target: String
+        let port: Int?
+
+        var displayName: String {
+            if let port { return "\(target):\(port)" }
+            return target
+        }
+
+        var sshArgs: [String] {
+            var args = [
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=2",
+                "-o", "ConnectionAttempts=1",
+                "-o", "ServerAliveInterval=2",
+                "-o", "ServerAliveCountMax=1",
+            ]
+            if let port {
+                args.append(contentsOf: ["-p", "\(port)"])
+            }
+            args.append(target)
+            args.append("LC_ALL=C PATH=/usr/bin:/bin:/usr/sbin:/sbin ps -eo pid,ppid,tty,%cpu,command")
+            return args
+        }
+    }
+
+    private struct SSHProxySession {
+        let pid: Int32
+        let tty: String
+        let destination: SSHDestination
+    }
+
+    private struct RemoteHostSnapshot {
+        let processes: [ProcessSnapshot]
+        let byParent: [Int32: [ProcessSnapshot]]
+    }
+
+    private struct CachedRemoteSnapshot {
+        let fetchedAt: Date
+        let snapshot: RemoteHostSnapshot?
+    }
+
     private var cpuHistory: [Int32: [Double]] = [:]
     private var lastCpuActivityAt: [Int32: Date] = [:]
     private var wasWorking: Set<Int32> = []
@@ -422,40 +491,61 @@ class SessionDetector {
     private var claudeSessionPathById: [String: String] = [:]
     private var claudeIndexCacheByProjectPath: [String: [ClaudeIndexEntry]] = [:]
     private var claudeIndexMtimeByProjectPath: [String: Date] = [:]
+    private var remoteSnapshotCache: [SSHDestination: CachedRemoteSnapshot] = [:]
+    private let remoteSnapshotTTL: TimeInterval = 4
 
     func detectSessions() -> [ClaudeSession] {
-        let pipe = Pipe()
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/ps")
-        proc.arguments = ["-eo", "pid,ppid,tty,%cpu,command"]
-        proc.standardOutput = pipe
-        proc.standardError = FileHandle.nullDevice
-        do { try proc.run() } catch { return [] }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        proc.waitUntilExit()
-        guard let output = String(data: data, encoding: .utf8) else { return [] }
+        guard let output = runProcess(path: "/bin/ps", arguments: ["-eo", "pid,ppid,tty,%cpu,command"]) else {
+            return []
+        }
 
         let processes = parseProcessSnapshots(from: output)
         let byParent = Dictionary(grouping: processes, by: \.ppid)
 
+        var sessions = localAgentSessions(from: processes, byParent: byParent)
+        sessions.append(contentsOf: remoteAgentSessions(from: processes))
+
+        let alive = Set(sessions.map { $0.pid })
+        cpuHistory = cpuHistory.filter { alive.contains($0.key) }
+        lastCpuActivityAt = lastCpuActivityAt.filter { alive.contains($0.key) }
+        wasWorking = wasWorking.filter { alive.contains($0) }
+        workingTickCount = workingTickCount.filter { alive.contains($0.key) }
+        postWorkIdleTicks = postWorkIdleTicks.filter { alive.contains($0.key) }
+        codexSessionPathByPid = codexSessionPathByPid.filter { alive.contains($0.key) }
+        claudeSessionIdByPid = claudeSessionIdByPid.filter { alive.contains($0.key) }
+        let activeDestinations = Set(remoteSSHProxySessions(from: processes).map(\.destination))
+        remoteSnapshotCache = remoteSnapshotCache.filter { activeDestinations.contains($0.key) }
+
+        let activeNamingKeys = Set(sessions.map { session -> String in
+            if let remoteHost = session.remoteHost {
+                return "ssh:\(session.tty):\(remoteHost):\(session.remoteTTY ?? ""):\(session.tool.rawValue)"
+            }
+            return session.tty
+        })
+        ClaudeNamer.prune(activeKeys: activeNamingKeys)
+
+        sessions.sort { lhs, rhs in
+            if lhs.tty != rhs.tty { return lhs.tty < rhs.tty }
+            if lhs.isRemote != rhs.isRemote { return !lhs.isRemote }
+            if lhs.tool != rhs.tool { return lhs.tool.rawValue < rhs.tool.rawValue }
+            return lhs.pid < rhs.pid
+        }
+        return sessions
+    }
+
+    private func localAgentSessions(from processes: [ProcessSnapshot], byParent: [Int32: [ProcessSnapshot]]) -> [ClaudeSession] {
         var sessions: [ClaudeSession] = []
         var seen = Set<Int32>()
 
         for process in processes {
             let pid = process.pid
-            guard !seen.contains(pid) else { continue }
+            guard !seen.contains(pid),
+                  let tool = tool(for: process),
+                  isInteractiveTTY(process.tty)
+            else {
+                continue
+            }
 
-            let tool: SessionTool
-            if process.binaryName == "claude" { tool = .claude }
-            else if process.binaryName == "codex" { tool = .codex }
-            else { continue }
-
-            if process.command.contains("AgentMonitor") { continue }
-
-            let tty = process.tty
-            guard tty != "??" else { continue }
-
-            // -p/--print filter is Claude-specific (subagent mode)
             if tool == .claude {
                 let isPiped = process.command.contains(" -p ") || process.command.contains(" --print")
                 guard !isPiped else { continue }
@@ -463,16 +553,8 @@ class SessionDetector {
 
             seen.insert(pid)
 
-            // Codex often does heavy work in descendants; Claude activity is better
-            // represented by the top-level CLI process to reduce false positives.
             let descendantCpu = (tool == .codex) ? descendantCPU(for: pid, byParent: byParent) : 0.0
-            let effectiveCpu = process.cpu + descendantCpu
-            var hist = cpuHistory[pid] ?? []
-            hist.append(effectiveCpu)
-            if hist.count > 3 { hist.removeFirst() }
-            cpuHistory[pid] = hist
-            let smoothed = hist.reduce(0, +) / Double(hist.count)
-
+            let smoothed = smoothedCPU(for: pid, cpu: process.cpu + descendantCpu)
             let cwdPath = SessionDetector.cwdPath(forPid: pid)
             let folder = cwdPath.map { ($0 as NSString).lastPathComponent }
             let convo = conversationMeta(for: tool, pid: pid, cwdPath: cwdPath)
@@ -490,27 +572,90 @@ class SessionDetector {
             }
 
             sessions.append(ClaudeSession(
-                pid: pid, tty: tty, tool: tool, isInteractive: true,
-                commandArgs: process.command, smoothedCpu: smoothed, state: state,
-                cwdPath: cwdPath, folderName: folder,
-                conversationId: convo.id, conversationTitle: title,
-                conversationMatchStatus: convo.matchStatus
+                pid: pid,
+                tty: process.tty,
+                tool: tool,
+                isInteractive: true,
+                commandArgs: process.command,
+                smoothedCpu: smoothed,
+                state: state,
+                cwdPath: cwdPath,
+                folderName: folder,
+                conversationId: convo.id,
+                conversationTitle: title,
+                conversationMatchStatus: convo.matchStatus,
+                remoteHost: nil,
+                remoteTTY: nil
             ))
         }
 
-        let alive = Set(sessions.map { $0.pid })
-        cpuHistory = cpuHistory.filter { alive.contains($0.key) }
-        lastCpuActivityAt = lastCpuActivityAt.filter { alive.contains($0.key) }
-        wasWorking = wasWorking.filter { alive.contains($0) }
-        workingTickCount = workingTickCount.filter { alive.contains($0.key) }
-        postWorkIdleTicks = postWorkIdleTicks.filter { alive.contains($0.key) }
-        codexSessionPathByPid = codexSessionPathByPid.filter { alive.contains($0.key) }
-        claudeSessionIdByPid = claudeSessionIdByPid.filter { alive.contains($0.key) }
+        return sessions
+    }
 
-        let activeTTYs = Set(sessions.map { $0.tty })
-        ClaudeNamer.prune(activeTTYs: activeTTYs)
+    private func remoteAgentSessions(from localProcesses: [ProcessSnapshot]) -> [ClaudeSession] {
+        let proxies = remoteSSHProxySessions(from: localProcesses)
+        guard !proxies.isEmpty else { return [] }
 
-        sessions.sort { $0.tty < $1.tty }
+        let grouped = Dictionary(grouping: proxies, by: \.destination)
+        var sessions: [ClaudeSession] = []
+
+        for (destination, group) in grouped {
+            guard let snapshot = remoteSnapshot(for: destination) else { continue }
+            sessions.append(contentsOf: synthesizeRemoteSessions(for: group, destination: destination, snapshot: snapshot))
+        }
+
+        return sessions
+    }
+
+    private func synthesizeRemoteSessions(
+        for proxies: [SSHProxySession],
+        destination: SSHDestination,
+        snapshot: RemoteHostSnapshot
+    ) -> [ClaudeSession] {
+        let sortedProxies = proxies.sorted { $0.pid < $1.pid }
+        let orderedTTYs = remoteTTYOrder(from: snapshot.processes)
+        guard !sortedProxies.isEmpty, !orderedTTYs.isEmpty else { return [] }
+
+        var sessions: [ClaudeSession] = []
+        // We cannot identify the exact existing remote PTY for a given local ssh client
+        // without cooperation from that shell, so we pair by connection creation order.
+        for (proxy, remoteTTY) in zip(sortedProxies, orderedTTYs) {
+            let ttyProcesses = snapshot.processes.filter { $0.tty == remoteTTY }
+            for process in ttyProcesses {
+                guard let tool = tool(for: process),
+                      isInteractiveTTY(process.tty)
+                else {
+                    continue
+                }
+                if tool == .claude {
+                    let isPiped = process.command.contains(" -p ") || process.command.contains(" --print")
+                    guard !isPiped else { continue }
+                }
+
+                let syntheticPid = syntheticRemotePid(localSSH: proxy.pid, remotePid: process.pid, tool: tool)
+                let descendantCpu = (tool == .codex) ? descendantCPU(for: process.pid, byParent: snapshot.byParent) : 0.0
+                let smoothed = smoothedCPU(for: syntheticPid, cpu: process.cpu + descendantCpu)
+                let state = cpuDrivenState(for: syntheticPid, tool: tool, smoothedCpu: smoothed)
+
+                sessions.append(ClaudeSession(
+                    pid: syntheticPid,
+                    tty: proxy.tty,
+                    tool: tool,
+                    isInteractive: true,
+                    commandArgs: process.command,
+                    smoothedCpu: smoothed,
+                    state: state,
+                    cwdPath: nil,
+                    folderName: nil,
+                    conversationId: nil,
+                    conversationTitle: nil,
+                    conversationMatchStatus: .unavailable,
+                    remoteHost: destination.displayName,
+                    remoteTTY: remoteTTY
+                ))
+            }
+        }
+
         return sessions
     }
 
@@ -540,6 +685,87 @@ class SessionDetector {
         return snapshots
     }
 
+    private func remoteSSHProxySessions(from processes: [ProcessSnapshot]) -> [SSHProxySession] {
+        processes.compactMap { process in
+            guard process.binaryName == "ssh",
+                  isInteractiveTTY(process.tty),
+                  let destination = sshDestination(from: process.command)
+            else {
+                return nil
+            }
+            return SSHProxySession(pid: process.pid, tty: process.tty, destination: destination)
+        }
+    }
+
+    private func sshDestination(from command: String) -> SSHDestination? {
+        let tokens = command.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard !tokens.isEmpty else { return nil }
+
+        let optionArgs: Set<String> = [
+            "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J",
+            "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w"
+        ]
+        let flagOnlyPrefixes = ["-4", "-6", "-A", "-a", "-C", "-f", "-G", "-g", "-K", "-k", "-M", "-N", "-n", "-q", "-s", "-T", "-t", "-V", "-v", "-X", "-x", "-Y", "-y"]
+
+        var idx = 1
+        var port: Int?
+        while idx < tokens.count {
+            let token = tokens[idx]
+            if token == "--" {
+                idx += 1
+                break
+            }
+            if !token.hasPrefix("-") {
+                break
+            }
+            if token == "-p", idx + 1 < tokens.count {
+                port = Int(tokens[idx + 1])
+                idx += 2
+                continue
+            }
+            if token.hasPrefix("-p"), token.count > 2 {
+                port = Int(String(token.dropFirst(2)))
+                idx += 1
+                continue
+            }
+            if optionArgs.contains(token) {
+                idx += 2
+                continue
+            }
+            if flagOnlyPrefixes.contains(token) {
+                idx += 1
+                continue
+            }
+            idx += 1
+        }
+
+        guard idx < tokens.count else { return nil }
+        let target = tokens[idx]
+        guard !target.isEmpty, !target.hasPrefix("-") else { return nil }
+        return SSHDestination(target: target, port: port)
+    }
+
+    private func remoteSnapshot(for destination: SSHDestination) -> RemoteHostSnapshot? {
+        let now = Date()
+        if let cached = remoteSnapshotCache[destination],
+           now.timeIntervalSince(cached.fetchedAt) < remoteSnapshotTTL {
+            return cached.snapshot
+        }
+
+        guard let output = runProcess(path: "/usr/bin/ssh", arguments: destination.sshArgs) else {
+            remoteSnapshotCache[destination] = CachedRemoteSnapshot(fetchedAt: now, snapshot: nil)
+            return nil
+        }
+
+        let processes = parseProcessSnapshots(from: output)
+        let snapshot = RemoteHostSnapshot(
+            processes: processes,
+            byParent: Dictionary(grouping: processes, by: \.ppid)
+        )
+        remoteSnapshotCache[destination] = CachedRemoteSnapshot(fetchedAt: now, snapshot: snapshot)
+        return snapshot
+    }
+
     private func descendantCPU(for pid: Int32, byParent: [Int32: [ProcessSnapshot]]) -> Double {
         var totalCPU = 0.0
         var stack: [Int32] = [pid]
@@ -556,6 +782,99 @@ class SessionDetector {
         }
 
         return totalCPU
+    }
+
+    private func descendants(of pid: Int32, byParent: [Int32: [ProcessSnapshot]]) -> [ProcessSnapshot] {
+        var collected: [ProcessSnapshot] = []
+        var stack: [Int32] = [pid]
+        var visited: Set<Int32> = [pid]
+
+        while let current = stack.popLast() {
+            guard let children = byParent[current] else { continue }
+            for child in children {
+                guard !visited.contains(child.pid) else { continue }
+                visited.insert(child.pid)
+                collected.append(child)
+                stack.append(child.pid)
+            }
+        }
+
+        return collected
+    }
+
+    private func remoteTTYOrder(from processes: [ProcessSnapshot]) -> [String] {
+        let interactive = processes.filter { isInteractiveTTY($0.tty) }
+        let pseudoTTYs = interactive.filter { isPseudoTTY($0.tty) }
+        let candidates = pseudoTTYs.isEmpty ? interactive : pseudoTTYs
+        var firstPidByTTY: [String: Int32] = [:]
+
+        for process in candidates {
+            if let existing = firstPidByTTY[process.tty] {
+                if process.pid < existing {
+                    firstPidByTTY[process.tty] = process.pid
+                }
+            } else {
+                firstPidByTTY[process.tty] = process.pid
+            }
+        }
+
+        return firstPidByTTY
+            .sorted { lhs, rhs in
+                if lhs.value != rhs.value { return lhs.value < rhs.value }
+                return lhs.key < rhs.key
+            }
+            .map(\.key)
+    }
+
+    private func isPseudoTTY(_ tty: String) -> Bool {
+        tty.hasPrefix("pts/") ||
+        tty.hasPrefix("ttys") ||
+        tty.hasPrefix("pty") ||
+        tty.contains("/pts/")
+    }
+
+    private func smoothedCPU(for pid: Int32, cpu: Double) -> Double {
+        var hist = cpuHistory[pid] ?? []
+        hist.append(cpu)
+        if hist.count > 3 { hist.removeFirst() }
+        cpuHistory[pid] = hist
+        return hist.reduce(0, +) / Double(hist.count)
+    }
+
+    private func tool(for process: ProcessSnapshot) -> SessionTool? {
+        if process.command.contains("AgentMonitor") { return nil }
+        if process.binaryName == "claude" { return .claude }
+        if process.binaryName == "codex" { return .codex }
+        return nil
+    }
+
+    private func isInteractiveTTY(_ tty: String) -> Bool {
+        !tty.isEmpty && tty != "?" && tty != "??"
+    }
+
+    private func syntheticRemotePid(localSSH: Int32, remotePid: Int32, tool: SessionTool) -> Int32 {
+        let raw = "ssh:\(localSSH):\(remotePid):\(tool.rawValue)"
+        var hash: UInt32 = 2166136261
+        for byte in raw.utf8 {
+            hash ^= UInt32(byte)
+            hash &*= 16777619
+        }
+        let folded = Int32(hash & 0x3fffffff)
+        return -(folded == 0 ? 1 : folded)
+    }
+
+    private func runProcess(path: String, arguments: [String]) -> String? {
+        let pipe = Pipe()
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: path)
+        proc.arguments = arguments
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        do { try proc.run() } catch { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 
     func clearDone(pid: Int32) {
