@@ -50,13 +50,17 @@ class ClaudeSessionView: NSView {
         let spriteTopInset: CGFloat = 4
         let frames = sprites.frames(for: session.tool, state: session.state)
         let img: NSImage
-        switch session.state {
-        case .working:
-            img = frames[animFrame % frames.count]
-        case .done:
-            img = frames[(animFrame / 4) % frames.count]
-        case .idle:
-            img = frames[(animFrame / 6) % frames.count]
+        if session.tool == .terminal {
+            img = frames[0]
+        } else {
+            switch session.state {
+            case .working:
+                img = frames[animFrame % frames.count]
+            case .done:
+                img = frames[(animFrame / 4) % frames.count]
+            case .idle:
+                img = frames[(animFrame / 6) % frames.count]
+            }
         }
 
         let x = tileBounds.minX + (tileBounds.width - img.size.width) / 2
@@ -69,10 +73,19 @@ class ClaudeSessionView: NSView {
         // Name label with tool badge
         let name = session.displayName
         let color: NSColor
-        switch session.state {
-        case .working: color = NSColor(red: 0.4, green: 0.9, blue: 0.5, alpha: 1.0)
-        case .done: color = NSColor(red: 0.3, green: 0.85, blue: 1.0, alpha: 1.0)
-        case .idle: color = NSColor(white: 0.6, alpha: 0.9)
+        if session.tool == .terminal {
+            switch session.state {
+            case .working:
+                color = NSColor(red: 0.48, green: 0.76, blue: 1.0, alpha: 1.0)
+            case .done, .idle:
+                color = NSColor(white: 0.62, alpha: 0.9)
+            }
+        } else {
+            switch session.state {
+            case .working: color = NSColor(red: 0.4, green: 0.9, blue: 0.5, alpha: 1.0)
+            case .done: color = NSColor(red: 0.3, green: 0.85, blue: 1.0, alpha: 1.0)
+            case .idle: color = NSColor(white: 0.6, alpha: 0.9)
+            }
         }
         let nameAttrs: [NSAttributedString.Key: Any] = [
             .font: safeMonospacedFont(ofSize: 12, weight: .bold),
@@ -95,7 +108,7 @@ class ClaudeSessionView: NSView {
         }
 
         // Activity dots for working
-        if session.state == .working {
+        if session.state == .working && session.tool != .terminal {
             let dots = (animFrame % 3) + 1
             NSColor(red: 0.4, green: 0.9, blue: 0.5, alpha: 0.9).setFill()
             let totalW = CGFloat(dots) * 4 + CGFloat(dots - 1) * 3

@@ -15,8 +15,10 @@ struct Clr {
     static let C = Clr(r: 0.91, g: 0.95, b: 1.00, a: 1)    // codex highlight
     static let G = Clr(r: 0.74, g: 0.79, b: 0.86, a: 1)    // codex gray accent
     static let g = Clr(r: 0.43, g: 0.48, b: 0.56, a: 1)    // codex gray shadow
+    static let M = Clr(r: 0.58, g: 0.63, b: 0.72, a: 1)    // terminal bezel mid-tone
     static let A = Clr(r: 0.50, g: 0.84, b: 0.76, a: 1)    // codex accent
     static let a = Clr(r: 0.18, g: 0.36, b: 0.45, a: 1)    // codex accent shadow
+    static let U = Clr(r: 0.36, g: 0.67, b: 1.00, a: 1)    // terminal cursor blue
     static let R = Clr(r: 0.76, g: 0.96, b: 0.84, a: 1)    // codex resolved core
     static let Q = Clr(r: 1.00, g: 1.00, b: 1.00, a: 1)    // alert bubble fill
     static let B = Clr(r: 0.03, g: 0.03, b: 0.04, a: 1)    // alert bubble outline / mark
@@ -28,7 +30,7 @@ typealias P = Clr?
 
 private let spritePalette: [Character: P] = [
     ".": nil, "O": .O, "W": .W, "S": .S, "E": .E, "T": .T, "t": .t, "X": .X,
-    "N": .N, "C": .C, "G": .G, "g": .g, "A": .A, "a": .a, "R": .R, "Q": .Q, "B": .B,
+    "N": .N, "C": .C, "G": .G, "g": .g, "M": .M, "A": .A, "a": .a, "U": .U, "R": .R, "Q": .Q, "B": .B,
 ]
 
 func sprite(_ rows: [String]) -> [[P]] {
@@ -450,6 +452,142 @@ let codexDoneFrame3: [[P]] = sprite([
     "......gggg........",
 ])
 
+// MARK: - Terminal Idle Frames (16x19)
+
+let terminalIdleFrame1: [[P]] = sprite([
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "..MMMMMMMMMMMM..",
+    "..M..........M..",
+    "..M..........M..",
+    "..M...Q......M..",
+    "..M....Q.....M..",
+    "..M.....Q....M..",
+    "..M....Q.....M..",
+    "..M...Q......M..",
+    "..M.....UUU..M..",
+    "..M..........M..",
+    "..MMMMMMMMMMMM..",
+])
+
+let terminalIdleFrame2: [[P]] = sprite([
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "..MMMMMMMMMMMM..",
+    "..M..........M..",
+    "..M..........M..",
+    "..M...Q......M..",
+    "..M....Q.....M..",
+    "..M.....Q....M..",
+    "..M....Q.....M..",
+    "..M...Q......M..",
+    "..M.....UUU..M..",
+    "..M..........M..",
+    "..MMMMMMMMMMMM..",
+])
+
+let terminalIdleFrame3: [[P]] = sprite([
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "..MMMMMMMMMMMM..",
+    "..M..........M..",
+    "..M..........M..",
+    "..M...Q......M..",
+    "..M....Q.....M..",
+    "..M.....Q....M..",
+    "..M....Q.....M..",
+    "..M...Q......M..",
+    "..M.....UUU..M..",
+    "..M..........M..",
+    "..MMMMMMMMMMMM..",
+])
+
+// MARK: - Terminal Working Frames (16x19)
+
+let terminalWorkFrame1: [[P]] = sprite([
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "..MMMMMMMMMMMM..",
+    "..M..........M..",
+    "..M..........M..",
+    "..M...Q......M..",
+    "..M....Q.....M..",
+    "..M.....Q....M..",
+    "..M....Q.....M..",
+    "..M...Q......M..",
+    "..M.....UUU..M..",
+    "..M..........M..",
+    "..MMMMMMMMMMMM..",
+])
+
+let terminalWorkFrame2: [[P]] = sprite([
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "..MMMMMMMMMMMM..",
+    "..M..........M..",
+    "..M..........M..",
+    "..M...Q......M..",
+    "..M....Q.....M..",
+    "..M.....Q....M..",
+    "..M....Q.....M..",
+    "..M...Q......M..",
+    "..M.....UUU..M..",
+    "..M..........M..",
+    "..MMMMMMMMMMMM..",
+])
+
+let terminalWorkFrame3: [[P]] = sprite([
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "..MMMMMMMMMMMM..",
+    "..M..........M..",
+    "..M..........M..",
+    "..M...Q......M..",
+    "..M....Q.....M..",
+    "..M.....Q....M..",
+    "..M....Q.....M..",
+    "..M...Q......M..",
+    "..M.....UUU..M..",
+    "..M..........M..",
+    "..MMMMMMMMMMMM..",
+])
+
 // MARK: - Sprite Renderer
 
 func renderSprite(_ sprite: [[P]], pixelSize: Int) -> NSImage {
@@ -497,9 +635,18 @@ struct ToolSpriteCache {
 struct SpriteCache {
     let claude: ToolSpriteCache
     let codex: ToolSpriteCache
+    let terminal: ToolSpriteCache
 
     func frames(for tool: SessionTool, state: SessionState) -> [NSImage] {
-        let set = tool == .codex ? codex : claude
+        let set: ToolSpriteCache
+        switch tool {
+        case .claude:
+            set = claude
+        case .codex:
+            set = codex
+        case .terminal:
+            set = terminal
+        }
         switch state {
         case .idle: return set.idle
         case .working: return set.work
@@ -541,6 +688,23 @@ struct SpriteCache {
                     renderSprite(codexDoneFrame1, pixelSize: 3),
                     renderSprite(codexDoneFrame2, pixelSize: 3),
                     renderSprite(codexDoneFrame3, pixelSize: 3),
+                ]
+            ),
+            terminal: ToolSpriteCache(
+                idle: [
+                    renderSprite(terminalIdleFrame1, pixelSize: 3),
+                    renderSprite(terminalIdleFrame2, pixelSize: 3),
+                    renderSprite(terminalIdleFrame3, pixelSize: 3),
+                ],
+                work: [
+                    renderSprite(terminalWorkFrame1, pixelSize: 3),
+                    renderSprite(terminalWorkFrame2, pixelSize: 3),
+                    renderSprite(terminalWorkFrame3, pixelSize: 3),
+                ],
+                done: [
+                    renderSprite(terminalIdleFrame1, pixelSize: 3),
+                    renderSprite(terminalIdleFrame2, pixelSize: 3),
+                    renderSprite(terminalIdleFrame3, pixelSize: 3),
                 ]
             )
         )

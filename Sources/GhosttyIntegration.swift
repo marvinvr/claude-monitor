@@ -199,6 +199,7 @@ extension AppDelegate {
 
     func candidateWindowPool(for session: ClaudeSession, windows: [AXUIElement]) -> [AXUIElement] {
         guard !session.isRemote else { return windows }
+        if session.tool == .terminal { return windows }
         let toolWindows = windows.filter { windowLikelyMatchesTool($0, tool: session.tool) }
         return toolWindows.isEmpty ? windows : toolWindows
     }
@@ -250,6 +251,8 @@ extension AppDelegate {
             return title.contains("codex")
         case .claude:
             return !title.contains("codex")
+        case .terminal:
+            return true
         }
     }
 
@@ -268,7 +271,7 @@ extension AppDelegate {
                 return remoteTitleNeedles(for: session).contains(where: { title.localizedCaseInsensitiveContains($0) })
             }
             if !hostMatches.isEmpty { candidateWindows = hostMatches }
-        } else {
+        } else if session.tool != .terminal {
             let toolMatches = candidateWindows.filter { windowLikelyMatchesTool($0, tool: session.tool) }
             if !toolMatches.isEmpty { candidateWindows = toolMatches }
         }
@@ -276,8 +279,10 @@ extension AppDelegate {
         let peerToolSessions: [ClaudeSession]
         if session.isRemote {
             peerToolSessions = sessions.filter { $0.isRemote && $0.remoteHost == session.remoteHost }
+        } else if session.tool == .terminal {
+            peerToolSessions = sessions.filter { !$0.isRemote }
         } else {
-            peerToolSessions = sessions.filter { $0.tool == session.tool }
+            peerToolSessions = sessions.filter { !$0.isRemote && $0.tool == session.tool }
         }
         var peerTTYs = Set(peerToolSessions.map(\.tty))
 

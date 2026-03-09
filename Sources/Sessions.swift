@@ -5,6 +5,7 @@ import Foundation
 enum SessionTool: String {
     case claude
     case codex
+    case terminal
 }
 
 // MARK: - Session State
@@ -72,30 +73,48 @@ struct ClaudeSession: Hashable {
         switch tool {
         case .claude: return "C"
         case .codex: return "X"
+        case .terminal: return "T"
         }
+    }
+
+    private func contextLabelMatchesDisplayName(_ label: String) -> Bool {
+        if label == displayName { return true }
+        guard tool == .terminal else { return false }
+        return displayName.hasPrefix(label + " #")
     }
 
     var subtitleText: String? {
         if let folder = folderName {
+            guard !contextLabelMatchesDisplayName(folder) else { return nil }
             return folder.count > 10 ? String(folder.prefix(7)) + "..." : folder
         }
         if let remoteHost {
+            guard !contextLabelMatchesDisplayName(remoteHost) else { return nil }
             return remoteHost.count > 10 ? String(remoteHost.prefix(7)) + "..." : remoteHost
         }
+        if tool == .terminal { return "-" }
         return nil
     }
 
     var tooltipText: String {
         let stateStr: String
-        switch state {
-        case .idle: stateStr = "Idle"
-        case .working: stateStr = "Working"
-        case .done: stateStr = "Done!"
+        if tool == .terminal {
+            switch state {
+            case .idle: stateStr = "Idle"
+            case .working: stateStr = "Active"
+            case .done: stateStr = "Idle"
+            }
+        } else {
+            switch state {
+            case .idle: stateStr = "Idle"
+            case .working: stateStr = "Working"
+            case .done: stateStr = "Done!"
+            }
         }
         let cpu = String(format: "%.1f%%", smoothedCpu)
         let name = displayName
         let toolName = tool.rawValue.capitalized
-        let folder = folderName.map { " in \($0)" } ?? ""
+        let folder = folderName.flatMap { contextLabelMatchesDisplayName($0) ? nil : " in \($0)" } ?? ""
         let convo = conversationId.map { "\nSession: \($0)" } ?? ""
         let remote: String
         if let remoteHost {
@@ -517,6 +536,10 @@ class SessionDetector {
 
         var sessions = localAgentSessions(from: processes, byParent: byParent)
         sessions.append(contentsOf: remoteAgentSessions(from: processes))
+        sessions.append(contentsOf: ghosttyTerminalSessions(
+            from: processes,
+            excludingTTYs: Set(sessions.map(\.tty))
+        ))
 
         let alive = Set(sessions.map { $0.pid })
         cpuHistory = cpuHistory.filter { alive.contains($0.key) }
@@ -648,6 +671,97 @@ class SessionDetector {
         return sessions
     }
 
+    private func ghosttyTerminalSessions(
+        from processes: [ProcessSnapshot],
+        excludingTTYs: Set<String>
+    ) -> [ClaudeSession] {
+        let loginTTYs = ghosttyLoginTTYs(from: processes)
+        guard !loginTTYs.isEmpty else { return [] }
+
+        let sshProxyByTTY = Dictionary(
+            remoteSSHProxySessions(from: processes).map { ($0.tty, $0.destination) },
+            uniquingKeysWith: { current, _ in current }
+        )
+
+        struct DraftTerminalSession {
+            let tty: String
+            let representative: ProcessSnapshot?
+            let sshDestination: SSHDestination?
+            let cwdPath: String?
+            let folderName: String?
+            let baseTitle: String?
+            let rawCpu: Double
+        }
+
+        var drafts: [DraftTerminalSession] = []
+        for tty in loginTTYs where !excludingTTYs.contains(tty) {
+            let ttyProcesses = processes.filter { $0.tty == tty }
+            let representative = representativeGhosttyProcess(forTTY: tty, processes: ttyProcesses)
+            let sshDestination = sshProxyByTTY[tty]
+            let cwdPath = sshDestination == nil ? representative.flatMap { cachedCwdPath(forPid: $0.pid) } : nil
+            let folderName = cwdPath.map { ($0 as NSString).lastPathComponent }
+            let baseTitle = terminalTitle(
+                cwdPath: cwdPath,
+                representative: representative,
+                sshDestination: sshDestination
+            )
+            drafts.append(DraftTerminalSession(
+                tty: tty,
+                representative: representative,
+                sshDestination: sshDestination,
+                cwdPath: cwdPath,
+                folderName: folderName,
+                baseTitle: baseTitle,
+                rawCpu: ttyProcesses.reduce(0.0) { $0 + $1.cpu }
+            ))
+        }
+
+        let titleCounts = drafts.reduce(into: [String: Int]()) { counts, draft in
+            guard let title = draft.baseTitle, !title.isEmpty else { return }
+            counts[title, default: 0] += 1
+        }
+        var titleOrdinals: [String: Int] = [:]
+        var sessions: [ClaudeSession] = []
+
+        for draft in drafts {
+            let title: String?
+            if let baseTitle = draft.baseTitle, !baseTitle.isEmpty {
+                if let count = titleCounts[baseTitle], count > 1 {
+                    let ordinal = titleOrdinals[baseTitle, default: 0] + 1
+                    titleOrdinals[baseTitle] = ordinal
+                    title = "\(baseTitle) #\(ordinal)"
+                } else {
+                    title = baseTitle
+                }
+            } else {
+                title = nil
+            }
+
+            let pid = syntheticTerminalPid(tty: draft.tty, remoteHost: draft.sshDestination?.displayName)
+            let smoothed = smoothedCPU(for: pid, cpu: draft.rawCpu)
+            let state = cpuDrivenState(for: pid, tool: .terminal, rawCpu: draft.rawCpu, smoothedCpu: smoothed)
+
+            sessions.append(ClaudeSession(
+                pid: pid,
+                tty: draft.tty,
+                tool: .terminal,
+                isInteractive: true,
+                commandArgs: draft.representative?.command ?? "",
+                smoothedCpu: smoothed,
+                state: state,
+                cwdPath: draft.cwdPath,
+                folderName: draft.folderName,
+                conversationId: nil,
+                conversationTitle: title,
+                conversationMatchStatus: .unavailable,
+                remoteHost: draft.sshDestination?.displayName,
+                remoteTTY: nil
+            ))
+        }
+
+        return sessions
+    }
+
     private func synthesizeRemoteSessions(
         for proxies: [SSHProxySession],
         destination: SSHDestination,
@@ -737,6 +851,50 @@ class SessionDetector {
             }
             return SSHProxySession(pid: process.pid, tty: process.tty, destination: destination)
         }
+    }
+
+    private func ghosttyLoginTTYs(from processes: [ProcessSnapshot]) -> [String] {
+        let ghosttyPids = Set(
+            processes
+                .filter { $0.binaryName == "ghostty" }
+                .map(\.pid)
+        )
+        guard !ghosttyPids.isEmpty else { return [] }
+
+        return processes
+            .filter { ghosttyPids.contains($0.ppid) && $0.command.contains("/usr/bin/login") }
+            .sorted { lhs, rhs in
+                if lhs.pid != rhs.pid { return lhs.pid < rhs.pid }
+                return lhs.tty < rhs.tty
+            }
+            .map(\.tty)
+    }
+
+    private func representativeGhosttyProcess(forTTY tty: String, processes: [ProcessSnapshot]) -> ProcessSnapshot? {
+        let filtered = processes.filter { process in
+            process.binaryName != "login" && process.binaryName != "ghostty"
+        }
+        return (filtered.isEmpty ? processes : filtered).max { lhs, rhs in lhs.pid < rhs.pid }
+    }
+
+    private func terminalTitle(
+        cwdPath: String?,
+        representative: ProcessSnapshot?,
+        sshDestination: SSHDestination?
+    ) -> String? {
+        if let sshDestination {
+            return sshDestination.displayName
+        }
+        if let representative {
+            let shellNames: Set<String> = ["zsh", "-zsh", "bash", "-bash", "sh", "-sh", "fish", "-fish", "tmux", "screen"]
+            if !shellNames.contains(representative.binaryName) {
+                return representative.binaryName
+            }
+        }
+        if cwdPath != nil {
+            return "terminal"
+        }
+        return "terminal"
     }
 
     private func sshDestination(from command: String) -> SSHDestination? {
@@ -905,6 +1063,17 @@ class SessionDetector {
         return -(folded == 0 ? 1 : folded)
     }
 
+    private func syntheticTerminalPid(tty: String, remoteHost: String?) -> Int32 {
+        let raw = "terminal:\(tty):\(remoteHost ?? "local")"
+        var hash: UInt32 = 2166136261
+        for byte in raw.utf8 {
+            hash ^= UInt32(byte)
+            hash &*= 16777619
+        }
+        let folded = Int32(hash & 0x3fffffff)
+        return -(folded == 0 ? 1 : folded)
+    }
+
     private func runProcess(path: String, arguments: [String]) -> String? {
         let pipe = Pipe()
         let proc = Process()
@@ -926,9 +1095,28 @@ class SessionDetector {
 
     private func cpuDrivenState(for pid: Int32, tool: SessionTool, rawCpu: Double, smoothedCpu: Double) -> SessionState {
         let now = Date()
-        let cpuThreshold = (tool == .codex) ? 1.25 : 8.0
-        let requiredTicks = (tool == .codex) ? 1 : 2
-        let immediateCpuThreshold = (tool == .codex) ? 1.25 : 16.0
+        let cpuThreshold: Double
+        let requiredTicks: Int
+        let immediateCpuThreshold: Double
+        let workingGrace: TimeInterval
+
+        switch tool {
+        case .claude:
+            cpuThreshold = 8.0
+            requiredTicks = 2
+            immediateCpuThreshold = 16.0
+            workingGrace = cpuWorkingGrace
+        case .codex:
+            cpuThreshold = 1.25
+            requiredTicks = 1
+            immediateCpuThreshold = 1.25
+            workingGrace = cpuWorkingGrace
+        case .terminal:
+            cpuThreshold = 2.0
+            requiredTicks = 1
+            immediateCpuThreshold = 8.0
+            workingGrace = 2.0
+        }
         let cpuHigh = smoothedCpu > cpuThreshold
         let immediateWorking = rawCpu > immediateCpuThreshold
         if immediateWorking {
@@ -949,10 +1137,15 @@ class SessionDetector {
         }
         if let lastCpuActivityAt = lastCpuActivityAt[pid] {
             let quietFor = now.timeIntervalSince(lastCpuActivityAt)
-            if quietFor <= cpuWorkingGrace {
+            if quietFor <= workingGrace {
                 wasWorking.insert(pid)
                 postWorkIdleTicks[pid] = 0
                 return .working
+            }
+            if tool == .terminal {
+                wasWorking.remove(pid)
+                postWorkIdleTicks[pid] = 0
+                return .idle
             }
             if quietFor <= cpuIdleDelay {
                 wasWorking.insert(pid)
@@ -992,6 +1185,8 @@ class SessionDetector {
                 cwdPath: cwdPath,
                 hasUniqueClaudeCwd: hasUniqueClaudeCwd
             )
+        case .terminal:
+            return ConversationMeta(id: nil, firstPrompt: nil, matchStatus: .unavailable, transcriptPath: nil)
         }
     }
 
@@ -1640,6 +1835,8 @@ class SessionDetector {
             activity = parseClaudeTranscriptActivity(path: path)
         case .codex:
             activity = parseCodexTranscriptActivity(path: path)
+        case .terminal:
+            activity = nil
         }
         transcriptActivityCacheByPath[path] = CachedTranscriptActivity(mtime: mtime, activity: activity)
         return activity
