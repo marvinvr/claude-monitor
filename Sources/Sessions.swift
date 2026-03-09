@@ -467,6 +467,7 @@ class SessionDetector {
         let pid: Int32
         let ppid: Int32
         let tty: String
+        let elapsedSeconds: Int
         let cpu: Double
         let command: String
         let binaryName: String
@@ -493,7 +494,7 @@ class SessionDetector {
                 args.append(contentsOf: ["-p", "\(port)"])
             }
             args.append(target)
-            args.append("LC_ALL=C PATH=/usr/bin:/bin:/usr/sbin:/sbin ps -eo pid,ppid,tty,%cpu,command")
+            args.append("LC_ALL=C PATH=/usr/bin:/bin:/usr/sbin:/sbin ps -eo pid,ppid,tty,etime,%cpu,command")
             return args
         }
     }
@@ -536,6 +537,7 @@ class SessionDetector {
     private var remoteSnapshotCache: [SSHDestination: CachedRemoteSnapshot] = [:]
     private let remoteSnapshotTTL: TimeInterval = 4
     private let cwdCacheTTL: TimeInterval = 3
+    private let agentStartupIdleGrace = 4
 
     func detectSessions() -> [ClaudeSession] {
         guard let snapshot = makeSnapshot() else {
@@ -581,7 +583,7 @@ class SessionDetector {
     }
 
     func makeSnapshot() -> SystemSnapshot? {
-        guard let output = runProcess(path: "/bin/ps", arguments: ["-eo", "pid,ppid,tty,%cpu,command"]) else {
+        guard let output = runProcess(path: "/bin/ps", arguments: ["-eo", "pid,ppid,tty,etime,%cpu,command"]) else {
             return nil
         }
         let processes = parseProcessSnapshots(from: output)
@@ -659,8 +661,14 @@ class SessionDetector {
                 hasUniqueClaudeCwd: hasUniqueClaudeCwd
             )
             let transcriptState = transcriptState(for: tool, conversation: convo)
-            let cpuState = cpuDrivenState(for: pid, tool: tool, rawCpu: rawCpu, smoothedCpu: smoothed)
-            let state = transcriptState ?? cpuState
+            let state: SessionState
+            if let transcriptState {
+                state = transcriptState
+            } else if shouldSuppressAgentStartupActivity(process: process, matchStatus: convo.matchStatus) {
+                state = .idle
+            } else {
+                state = cpuDrivenState(for: pid, tool: tool, rawCpu: rawCpu, smoothedCpu: smoothed)
+            }
             let conversationKey = convo.id.map { "\(tool.rawValue):\($0)" }
             let title: String?
             if convo.matchStatus == .verified,
@@ -855,20 +863,22 @@ class SessionDetector {
         var snapshots: [ProcessSnapshot] = []
         for line in output.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            let parts = trimmed.split(separator: " ", maxSplits: 4, omittingEmptySubsequences: true)
-            guard parts.count >= 5,
+            let parts = trimmed.split(separator: " ", maxSplits: 5, omittingEmptySubsequences: true)
+            guard parts.count >= 6,
                   let pid = Int32(parts[0]),
                   let ppid = Int32(parts[1]) else { continue }
 
             let tty = String(parts[2])
-            let cpu = Double(parts[3]) ?? 0.0
-            let command = String(parts[4])
+            let elapsedSeconds = Self.parseElapsedTime(String(parts[3])) ?? 0
+            let cpu = Double(parts[4]) ?? 0.0
+            let command = String(parts[5])
             let binary = command.split(separator: " ", maxSplits: 1).first.map(String.init) ?? ""
             let binaryName = (binary as NSString).lastPathComponent
             snapshots.append(ProcessSnapshot(
                 pid: pid,
                 ppid: ppid,
                 tty: tty,
+                elapsedSeconds: elapsedSeconds,
                 cpu: cpu,
                 command: command,
                 binaryName: binaryName
@@ -1082,6 +1092,39 @@ class SessionDetector {
         if process.binaryName == "claude" { return .claude }
         if process.binaryName == "codex" { return .codex }
         return nil
+    }
+
+    private func shouldSuppressAgentStartupActivity(process: ProcessSnapshot, matchStatus: ConversationMatchStatus) -> Bool {
+        guard let tool = tool(for: process),
+              tool != .terminal,
+              matchStatus != .verified
+        else {
+            return false
+        }
+        return process.elapsedSeconds <= agentStartupIdleGrace
+    }
+
+    private static func parseElapsedTime(_ raw: String) -> Int? {
+        let dayParts = raw.split(separator: "-", maxSplits: 1).map(String.init)
+        let timePart: String
+        let days: Int
+        if dayParts.count == 2 {
+            days = Int(dayParts[0]) ?? 0
+            timePart = dayParts[1]
+        } else {
+            days = 0
+            timePart = raw
+        }
+
+        let components = timePart.split(separator: ":").compactMap { Int($0) }
+        switch components.count {
+        case 2:
+            return days * 86_400 + components[0] * 60 + components[1]
+        case 3:
+            return days * 86_400 + components[0] * 3_600 + components[1] * 60 + components[2]
+        default:
+            return nil
+        }
     }
 
     private func isInteractiveTTY(_ tty: String) -> Bool {
