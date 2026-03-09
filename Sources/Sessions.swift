@@ -550,6 +550,25 @@ class SessionDetector {
     private func localAgentSessions(from processes: [ProcessSnapshot], byParent: [Int32: [ProcessSnapshot]]) -> [ClaudeSession] {
         var sessions: [ClaudeSession] = []
         var seen = Set<Int32>()
+        var activeClaudeCountByCwd: [String: Int] = [:]
+
+        for process in processes {
+            guard let tool = tool(for: process),
+                  tool == .claude,
+                  isInteractiveTTY(process.tty)
+            else {
+                continue
+            }
+
+            let isPiped = process.command.contains(" -p ") || process.command.contains(" --print")
+            guard !isPiped,
+                  let cwdPath = cachedCwdPath(forPid: process.pid)
+            else {
+                continue
+            }
+
+            activeClaudeCountByCwd[cwdPath, default: 0] += 1
+        }
 
         for process in processes {
             let pid = process.pid
@@ -571,7 +590,14 @@ class SessionDetector {
             let smoothed = smoothedCPU(for: pid, cpu: process.cpu + descendantCpu)
             let cwdPath = cachedCwdPath(forPid: pid)
             let folder = cwdPath.map { ($0 as NSString).lastPathComponent }
-            let convo = conversationMeta(for: tool, pid: pid, cwdPath: cwdPath)
+            let hasUniqueClaudeCwd = tool == .claude
+                && cwdPath.map { (activeClaudeCountByCwd[$0] ?? 0) == 1 } == true
+            let convo = conversationMeta(
+                for: tool,
+                pid: pid,
+                cwdPath: cwdPath,
+                hasUniqueClaudeCwd: hasUniqueClaudeCwd
+            )
             let transcriptState = transcriptState(for: tool, conversation: convo)
             let cpuState = cpuDrivenState(for: pid, tool: tool, smoothedCpu: smoothed)
             let state = transcriptState ?? cpuState
@@ -944,12 +970,21 @@ class SessionDetector {
         return activity?.resolvedState(now: now)
     }
 
-    private func conversationMeta(for tool: SessionTool, pid: Int32, cwdPath: String?) -> ConversationMeta {
+    private func conversationMeta(
+        for tool: SessionTool,
+        pid: Int32,
+        cwdPath: String?,
+        hasUniqueClaudeCwd: Bool
+    ) -> ConversationMeta {
         switch tool {
         case .codex:
             return codexConversationMeta(forPid: pid)
         case .claude:
-            return claudeConversationMeta(forPid: pid, cwdPath: cwdPath)
+            return claudeConversationMeta(
+                forPid: pid,
+                cwdPath: cwdPath,
+                hasUniqueClaudeCwd: hasUniqueClaudeCwd
+            )
         }
     }
 
@@ -970,8 +1005,17 @@ class SessionDetector {
         return parsed
     }
 
-    private func claudeConversationMeta(forPid pid: Int32, cwdPath: String?) -> ConversationMeta {
+    private func claudeConversationMeta(
+        forPid pid: Int32,
+        cwdPath: String?,
+        hasUniqueClaudeCwd: Bool
+    ) -> ConversationMeta {
         let discoveredExactSessionId = claudeSessionId(forPid: pid)
+            ?? claudeHistorySessionId(
+                forPid: pid,
+                cwdPath: cwdPath,
+                hasUniqueClaudeCwd: hasUniqueClaudeCwd
+            )
         let cachedSessionId = claudeSessionIdByPid[pid]
         let cachedVerifiedSessionId = cachedSessionId.flatMap {
             claudeMetaBySessionId[$0]?.matchStatus == .verified ? $0 : nil
@@ -1065,6 +1109,47 @@ class SessionDetector {
         return nil
     }
 
+    private func claudeHistorySessionId(
+        forPid pid: Int32,
+        cwdPath: String?,
+        hasUniqueClaudeCwd: Bool
+    ) -> String? {
+        guard hasUniqueClaudeCwd,
+              let cwdPath
+        else {
+            return nil
+        }
+
+        let historyPath = (NSHomeDirectory() as NSString).appendingPathComponent(".claude/history.jsonl")
+        guard let lines = Self.readTailLines(path: historyPath, maxBytes: 240_000) else {
+            return nil
+        }
+
+        let processStartedAt = processStartDate(forPid: pid)
+        for line in lines.reversed() {
+            guard let data = line.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let project = object["project"] as? String,
+                  project == cwdPath,
+                  let sessionId = object["sessionId"] as? String
+            else {
+                continue
+            }
+
+            if let processStartedAt,
+               let timestampMs = object["timestamp"] as? NSNumber {
+                let entryDate = Date(timeIntervalSince1970: timestampMs.doubleValue / 1000)
+                if entryDate.timeIntervalSince(processStartedAt) < -30 {
+                    continue
+                }
+            }
+
+            return sessionId
+        }
+
+        return nil
+    }
+
     private func claudeSessionPath(forSessionId sessionId: String, cwdPath: String?) -> String? {
         if let cached = claudeSessionPathById[sessionId], FileManager.default.fileExists(atPath: cached) {
             return cached
@@ -1119,7 +1204,7 @@ class SessionDetector {
         if let cached = claudeIndexCacheByProjectPath[indexPath],
            let cachedMtime = claudeIndexMtimeByProjectPath[indexPath],
            cachedMtime == mtime {
-            return cached
+            return mergeClaudeIndexEntries(cached, withProjectFilesForCwd: cwdPath)
         }
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: indexPath)),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -1127,7 +1212,7 @@ class SessionDetector {
         else {
             claudeIndexCacheByProjectPath[indexPath] = []
             claudeIndexMtimeByProjectPath[indexPath] = mtime
-            return []
+            return claudeProjectSessionEntries(forCwd: cwdPath)
         }
 
         let now = Date()
@@ -1142,7 +1227,52 @@ class SessionDetector {
         let sorted = parsed.sorted { $0.modified > $1.modified }
         claudeIndexCacheByProjectPath[indexPath] = sorted
         claudeIndexMtimeByProjectPath[indexPath] = mtime
-        return sorted
+        return mergeClaudeIndexEntries(sorted, withProjectFilesForCwd: cwdPath)
+    }
+
+    private func mergeClaudeIndexEntries(
+        _ indexedEntries: [ClaudeIndexEntry],
+        withProjectFilesForCwd cwdPath: String
+    ) -> [ClaudeIndexEntry] {
+        var mergedBySessionId = Dictionary(uniqueKeysWithValues: indexedEntries.map { ($0.sessionId, $0) })
+        for entry in claudeProjectSessionEntries(forCwd: cwdPath) {
+            if let existing = mergedBySessionId[entry.sessionId] {
+                mergedBySessionId[entry.sessionId] = ClaudeIndexEntry(
+                    sessionId: entry.sessionId,
+                    firstPrompt: existing.firstPrompt ?? entry.firstPrompt,
+                    modified: max(existing.modified, entry.modified)
+                )
+            } else {
+                mergedBySessionId[entry.sessionId] = entry
+            }
+        }
+        return mergedBySessionId.values.sorted { $0.modified > $1.modified }
+    }
+
+    private func claudeProjectSessionEntries(forCwd cwdPath: String) -> [ClaudeIndexEntry] {
+        let slug = Self.claudeProjectSlug(for: cwdPath)
+        let projectRoot = (NSHomeDirectory() as NSString)
+            .appendingPathComponent(".claude/projects/\(slug)")
+        let rootURL = URL(fileURLWithPath: projectRoot, isDirectory: true)
+        let fm = FileManager.default
+        guard let urls = try? fm.contentsOfDirectory(
+            at: rootURL,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        return urls.compactMap { url in
+            guard url.pathExtension == "jsonl" else { return nil }
+            let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return ClaudeIndexEntry(
+                sessionId: url.deletingPathExtension().lastPathComponent,
+                firstPrompt: nil,
+                modified: modified
+            )
+        }
+        .sorted { $0.modified > $1.modified }
     }
 
     private func parseCodexSessionMeta(path: String) -> ConversationMeta {
@@ -1461,6 +1591,22 @@ class SessionDetector {
     private static func readAllLines(path: String) -> [String]? {
         guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
         return text.components(separatedBy: "\n")
+    }
+
+    private func processStartDate(forPid pid: Int32) -> Date? {
+        guard let output = runProcess(path: "/bin/ps", arguments: ["-p", "\(pid)", "-o", "lstart="]) else {
+            return nil
+        }
+        let normalized = output
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        guard !normalized.isEmpty else { return nil }
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "EEE MMM d HH:mm:ss yyyy"
+        return formatter.date(from: normalized)
     }
 
     private func cachedCwdPath(forPid pid: Int32) -> String? {
