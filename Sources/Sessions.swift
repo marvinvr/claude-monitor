@@ -457,7 +457,13 @@ private struct TranscriptActivity {
 // MARK: - Session Detector
 
 class SessionDetector {
-    private struct ProcessSnapshot {
+    private let providers: [any SessionProvider] = [
+        LocalAgentSessionProvider(),
+        RemoteAgentSessionProvider(),
+        GhosttyTerminalSessionProvider(),
+    ]
+
+    struct ProcessSnapshot {
         let pid: Int32
         let ppid: Int32
         let tty: String
@@ -532,19 +538,18 @@ class SessionDetector {
     private let cwdCacheTTL: TimeInterval = 3
 
     func detectSessions() -> [ClaudeSession] {
-        guard let output = runProcess(path: "/bin/ps", arguments: ["-eo", "pid,ppid,tty,%cpu,command"]) else {
+        guard let snapshot = makeSnapshot() else {
             return []
         }
 
-        let processes = parseProcessSnapshots(from: output)
-        let byParent = Dictionary(grouping: processes, by: \.ppid)
-
-        var sessions = localAgentSessions(from: processes, byParent: byParent)
-        sessions.append(contentsOf: remoteAgentSessions(from: processes))
-        sessions.append(contentsOf: ghosttyTerminalSessions(
-            from: processes,
-            excludingTTYs: Set(sessions.map(\.tty))
-        ))
+        var sessions: [ClaudeSession] = []
+        for provider in providers {
+            sessions.append(contentsOf: provider.detect(
+                in: snapshot,
+                existingSessions: sessions,
+                detector: self
+            ))
+        }
 
         let alive = Set(sessions.map { $0.pid })
         cpuHistory = cpuHistory.filter { alive.contains($0.key) }
@@ -555,7 +560,7 @@ class SessionDetector {
         codexSessionPathByPid = codexSessionPathByPid.filter { alive.contains($0.key) }
         claudeSessionIdByPid = claudeSessionIdByPid.filter { alive.contains($0.key) }
         cwdPathCacheByPid = cwdPathCacheByPid.filter { alive.contains($0.key) }
-        let activeDestinations = Set(remoteSSHProxySessions(from: processes).map(\.destination))
+        let activeDestinations = Set(remoteSSHProxySessions(from: snapshot.processes).map(\.destination))
         remoteSnapshotCache = remoteSnapshotCache.filter { activeDestinations.contains($0.key) }
 
         let activeNamingKeys = Set(sessions.map { session -> String in
@@ -573,6 +578,32 @@ class SessionDetector {
             return lhs.pid < rhs.pid
         }
         return sessions
+    }
+
+    func makeSnapshot() -> SystemSnapshot? {
+        guard let output = runProcess(path: "/bin/ps", arguments: ["-eo", "pid,ppid,tty,%cpu,command"]) else {
+            return nil
+        }
+        let processes = parseProcessSnapshots(from: output)
+        return SystemSnapshot(
+            processes: processes,
+            byParent: Dictionary(grouping: processes, by: \.ppid)
+        )
+    }
+
+    func detectLocalAgentSessions(in snapshot: SystemSnapshot) -> [ClaudeSession] {
+        localAgentSessions(from: snapshot.processes, byParent: snapshot.byParent)
+    }
+
+    func detectRemoteAgentSessions(in snapshot: SystemSnapshot) -> [ClaudeSession] {
+        remoteAgentSessions(from: snapshot.processes)
+    }
+
+    func detectGhosttyTerminalSessions(in snapshot: SystemSnapshot, existingSessions: [ClaudeSession]) -> [ClaudeSession] {
+        ghosttyTerminalSessions(
+            from: snapshot.processes,
+            excludingTTYs: Set(existingSessions.map(\.tty))
+        )
     }
 
     private func localAgentSessions(from processes: [ProcessSnapshot], byParent: [Int32: [ProcessSnapshot]]) -> [ClaudeSession] {
