@@ -112,6 +112,13 @@ extension AppDelegate {
             return false
         }
 
+        if let processName = soloProcessName(forPid: session.pid) {
+            solo.activate()
+            if openSoloProcess(processName, app: solo) {
+                return true
+            }
+        }
+
         if allowFallbackActivation {
             solo.activate()
             return true
@@ -387,6 +394,131 @@ extension AppDelegate {
 
         AXUIElementPerformAction(item, kAXPressAction as CFString)
         return true
+    }
+
+    func openSoloProcess(_ processName: String, app: NSRunningApplication) -> Bool {
+        guard pressMenuItem(named: "Command Palette...", inMenuNamed: "View", for: app) else { return false }
+        usleep(250_000)
+
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        guard axElement(of: axApp, attribute: kAXFocusedUIElementAttribute as String) != nil else { return false }
+
+        // Replace any stale palette query before searching for the process action.
+        pressSelectAll()
+        usleep(40_000)
+        pressDelete()
+        usleep(40_000)
+        typeText(processName)
+        usleep(250_000)
+
+        guard let target = soloCommandPaletteButton(
+            in: axWindows(of: axApp),
+            matching: processName
+        ) else {
+            pressEscape()
+            return false
+        }
+
+        AXUIElementPerformAction(target, kAXPressAction as CFString)
+        app.activate()
+        return true
+    }
+
+    func soloCommandPaletteButton(in windows: [AXUIElement], matching processName: String) -> AXUIElement? {
+        var queue = windows
+        var index = 0
+
+        while index < queue.count {
+            let element = queue[index]
+            index += 1
+
+            var roleRef: AnyObject?
+            AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef)
+            let role = roleRef as? String ?? ""
+            let title = axTitle(of: element)
+
+            if role == kAXButtonRole as String,
+               title.localizedCaseInsensitiveContains(processName),
+               title.localizedCaseInsensitiveContains("Go to process") {
+                return element
+            }
+
+            queue.append(contentsOf: axChildren(of: element))
+            queue.append(contentsOf: axChildren(of: element, attribute: kAXContentsAttribute as String))
+        }
+
+        return nil
+    }
+
+    func soloProcessName(forPid pid: Int32) -> String? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let dbPath = "\(home)/.config/soloterm/solo.db"
+        guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
+
+        let query = "select process_name from spawned_processes where pid = \(pid) order by id desc limit 1;"
+        let pipe = Pipe()
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        proc.arguments = [dbPath, query]
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+
+        do {
+            try proc.run()
+        } catch {
+            return nil
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0,
+              let output = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !output.isEmpty else {
+            return nil
+        }
+
+        return output
+    }
+
+    func pressSelectAll() {
+        pressKey(0, flags: .maskCommand)
+    }
+
+    func pressDelete() {
+        pressKey(51)
+    }
+
+    func pressEscape() {
+        pressKey(53)
+    }
+
+    func pressKey(_ keyCode: UInt16, flags: CGEventFlags = []) {
+        let src = CGEventSource(stateID: .hidSystemState)
+        let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true)
+        down?.flags = flags
+        down?.post(tap: .cghidEventTap)
+
+        let up = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false)
+        up?.flags = flags
+        up?.post(tap: .cghidEventTap)
+    }
+
+    func typeText(_ text: String) {
+        for scalar in text.unicodeScalars {
+            let src = CGEventSource(stateID: .hidSystemState)
+            let value = UniChar(scalar.value)
+
+            let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true)
+            var downValue = value
+            down?.keyboardSetUnicodeString(stringLength: 1, unicodeString: &downValue)
+            down?.post(tap: .cghidEventTap)
+
+            let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false)
+            var upValue = value
+            up?.keyboardSetUnicodeString(stringLength: 1, unicodeString: &upValue)
+            up?.post(tap: .cghidEventTap)
+        }
     }
 
     func remoteTitleNeedles(for session: ClaudeSession) -> [String] {
