@@ -45,6 +45,12 @@ extension AppDelegate {
         let title: String
     }
 
+    struct SoloShortcutTarget {
+        let projectIndex: Int
+        let processIndex: Int
+        let processName: String
+    }
+
     func jumpTo(_ session: ClaudeSession) {
         switch session.hostApp {
         case .solo:
@@ -112,7 +118,15 @@ extension AppDelegate {
             return false
         }
 
-        if let processName = soloProcessName(forPid: session.pid) {
+        if let shortcutTarget = soloShortcutTarget(forPid: session.pid) {
+            solo.activate()
+            if activateSoloShortcutTarget(shortcutTarget, app: solo) {
+                return true
+            }
+            if openSoloProcess(shortcutTarget.processName, app: solo) {
+                return true
+            }
+        } else if let processName = soloProcessName(forPid: session.pid) {
             solo.activate()
             if openSoloProcess(processName, app: solo) {
                 return true
@@ -371,6 +385,58 @@ extension AppDelegate {
         return best.0
     }
 
+    func ensureSoloMainWindow(app: NSRunningApplication) -> Bool {
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+
+        guard let focusedWindow = axElement(of: axApp, attribute: kAXFocusedWindowAttribute as String) else {
+            app.activate()
+            return true
+        }
+
+        guard axTitle(of: focusedWindow).localizedCaseInsensitiveContains("Settings") else {
+            return true
+        }
+
+        guard let closeButton = soloCloseSettingsButton(in: focusedWindow),
+              AXUIElementPerformAction(closeButton, kAXPressAction as CFString) == .success else {
+            return false
+        }
+
+        usleep(220_000)
+        guard let nextFocusedWindow = axElement(of: axApp, attribute: kAXFocusedWindowAttribute as String) else {
+            return true
+        }
+
+        return !axTitle(of: nextFocusedWindow).localizedCaseInsensitiveContains("Settings")
+    }
+
+    func soloCloseSettingsButton(in window: AXUIElement) -> AXUIElement? {
+        var queue = [window]
+        var index = 0
+
+        while index < queue.count {
+            let element = queue[index]
+            index += 1
+
+            var roleRef: AnyObject?
+            AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef)
+            let role = roleRef as? String ?? ""
+
+            var descriptionRef: AnyObject?
+            AXUIElementCopyAttributeValue(element, kAXDescriptionAttribute as CFString, &descriptionRef)
+            let description = descriptionRef as? String ?? ""
+
+            if role == kAXButtonRole as String, description == "Close settings" {
+                return element
+            }
+
+            queue.append(contentsOf: axChildren(of: element))
+            queue.append(contentsOf: axChildren(of: element, attribute: kAXContentsAttribute as String))
+        }
+
+        return nil
+    }
+
     func pressMenuItem(named itemTitle: String, inMenuNamed menuTitle: String, for app: NSRunningApplication) -> Bool {
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
         guard let menuBar = axElement(of: axApp, attribute: kAXMenuBarAttribute as String) else { return false }
@@ -424,6 +490,27 @@ extension AppDelegate {
         return true
     }
 
+    func activateSoloShortcutTarget(_ target: SoloShortcutTarget, app: NSRunningApplication) -> Bool {
+        guard (1...9).contains(target.projectIndex),
+              (1...9).contains(target.processIndex),
+              let projectKey = digitKeyCode(for: target.projectIndex),
+              let processKey = digitKeyCode(for: target.processIndex) else {
+            return false
+        }
+
+        app.activate()
+        usleep(180_000)
+        guard ensureSoloMainWindow(app: app) else { return false }
+        usleep(120_000)
+
+        pressKey(projectKey, flags: .maskAlternate)
+        usleep(140_000)
+        pressKey(processKey, flags: .maskCommand)
+        usleep(140_000)
+        app.activate()
+        return true
+    }
+
     func soloCommandPaletteButton(in windows: [AXUIElement], matching processName: String) -> AXUIElement? {
         var queue = windows
         var index = 0
@@ -450,12 +537,79 @@ extension AppDelegate {
         return nil
     }
 
+    func soloShortcutTarget(forPid pid: Int32) -> SoloShortcutTarget? {
+        guard let output = soloQuery("""
+            with live as (
+                select project_path, process_name
+                from spawned_processes
+                where pid = \(pid)
+                order by id desc
+                limit 1
+            ),
+            ordered_projects as (
+                select
+                    id,
+                    path,
+                    row_number() over (order by position, id) as project_index
+                from projects
+            ),
+            ordered_processes as (
+                select
+                    project_id,
+                    name,
+                    row_number() over (
+                        partition by project_id
+                        order by
+                            case kind
+                                when 'agent' then 0
+                                when 'terminal' then 1
+                                else 2
+                            end,
+                            position,
+                            id
+                    ) as process_index
+                from processes
+            )
+            select
+                ordered_projects.project_index,
+                ordered_processes.process_index,
+                live.process_name
+            from live
+            join ordered_projects on ordered_projects.path = live.project_path
+            join ordered_processes
+                on ordered_processes.project_id = ordered_projects.id
+               and ordered_processes.name = live.process_name
+            limit 1;
+            """) else {
+            return nil
+        }
+
+        let fields = output.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+        guard fields.count == 3,
+              let projectIndex = Int(fields[0]),
+              let processIndex = Int(fields[1]) else {
+            return nil
+        }
+
+        let processName = fields[2].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !processName.isEmpty else { return nil }
+
+        return SoloShortcutTarget(
+            projectIndex: projectIndex,
+            processIndex: processIndex,
+            processName: processName
+        )
+    }
+
     func soloProcessName(forPid pid: Int32) -> String? {
+        soloQuery("select process_name from spawned_processes where pid = \(pid) order by id desc limit 1;")
+    }
+
+    func soloQuery(_ query: String) -> String? {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let dbPath = "\(home)/.config/soloterm/solo.db"
         guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
 
-        let query = "select process_name from spawned_processes where pid = \(pid) order by id desc limit 1;"
         let pipe = Pipe()
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
@@ -479,6 +633,21 @@ extension AppDelegate {
         }
 
         return output
+    }
+
+    func digitKeyCode(for index: Int) -> UInt16? {
+        switch index {
+        case 1: return 18
+        case 2: return 19
+        case 3: return 20
+        case 4: return 21
+        case 5: return 23
+        case 6: return 22
+        case 7: return 26
+        case 8: return 28
+        case 9: return 25
+        default: return nil
+        }
     }
 
     func pressSelectAll() {
